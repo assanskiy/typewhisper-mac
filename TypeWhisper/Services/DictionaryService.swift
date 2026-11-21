@@ -1975,3 +1975,34 @@ private extension String {
         }
     }
 }
+
+extension TranscriptionResult {
+    /// The result with Dictionary corrections applied to its text and segments, in one
+    /// pass so each correction is counted once. Word timings keep the engine's words;
+    /// speaker alignment keeps a segment whole when a corrected word is not found in it.
+    @MainActor
+    func applyingCorrections(using dictionaryService: DictionaryService) -> TranscriptionResult {
+        let correctedTexts = dictionaryService.applyCorrections(
+            to: [text] + segments.map(\.text)
+        )
+        let correctedSegments = zip(segments, correctedTexts.dropFirst()).map { segment, correctedText in
+            TranscriptionSegment(
+                text: correctedText,
+                start: segment.start,
+                end: segment.end,
+                speakerLabel: segment.speakerLabel,
+                speakerConfidence: segment.speakerConfidence
+            )
+        }
+
+        return TranscriptionResult(
+            text: correctedTexts.first ?? text,
+            detectedLanguage: detectedLanguage,
+            duration: duration,
+            processingTime: processingTime,
+            engineUsed: engineUsed,
+            segments: correctedSegments,
+            words: words
+        )
+    }
+}

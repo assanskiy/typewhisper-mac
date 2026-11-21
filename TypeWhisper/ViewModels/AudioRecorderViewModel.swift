@@ -1189,7 +1189,12 @@ final class AudioRecorderViewModel: ObservableObject {
 
             if let apiSessionID {
                 if let url {
-                    completeRecorderAPISession(id: apiSessionID, outputURL: url, text: partialText)
+                    // The preview stands in for the transcript, so it gets the same corrections.
+                    completeRecorderAPISession(
+                        id: apiSessionID,
+                        outputURL: url,
+                        text: dictionaryService.applyCorrections(to: partialText)
+                    )
                 } else {
                     failRecorderAPISession(id: apiSessionID, error: "Failed to finalize recording")
                 }
@@ -1892,11 +1897,11 @@ final class AudioRecorderViewModel: ObservableObject {
         guard sampleCount > 8000 else { // At least 0.5s of audio
             // Use streaming result as final if buffer too short
             if previewCanBeTranscript, !preview.isEmpty {
-                return (saveTranscriptOutcome(preview, for: request.outputURL, request: request), preview)
+                return savingCorrectedTranscript(preview, request: request)
             } else if let liveSessionResult = request.liveSessionResult {
                 let text = liveSessionResult.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !text.isEmpty {
-                    return (saveTranscriptOutcome(text, for: request.outputURL, request: request), text)
+                    return savingCorrectedTranscript(text, request: request)
                 }
             }
             return (.skipped, preview)
@@ -1906,11 +1911,14 @@ final class AudioRecorderViewModel: ObservableObject {
         let effectiveTask = resolvedTask(for: request)
 
         do {
-            let result = if let liveSessionResult = request.liveSessionResult {
+            let transcribed = if let liveSessionResult = request.liveSessionResult {
                 liveSessionResult
             } else {
                 try await transcribeFinalRecording(request, task: effectiveTask)
             }
+            // Corrected before saving, so the file, History, the speaker record and the
+            // Recorder completion all carry the Dictionary's corrections (#887).
+            let result = transcribed.applyingCorrections(using: dictionaryService)
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if !text.isEmpty {
                 // The transcript is saved first; adding the speaker record can take seconds.
@@ -1930,7 +1938,7 @@ final class AudioRecorderViewModel: ObservableObject {
                 announce(payload, waitingForSpeakers: speakerRecordID != nil)
                 return (outcome, text)
             } else if previewCanBeTranscript, !preview.isEmpty {
-                return (saveTranscriptOutcome(preview, for: request.outputURL, request: request), preview)
+                return savingCorrectedTranscript(preview, request: request)
             } else {
                 let failure = makeTranscriptionFailure(
                     phase: .emptyResult,
@@ -1951,7 +1959,7 @@ final class AudioRecorderViewModel: ObservableObject {
             // A WhisperKit error can mean that entire audio chunks are missing.
             // Its live preview must not turn that failure into a completed recording.
             if request.providerId != "whisper", previewCanBeTranscript, !preview.isEmpty {
-                return (saveTranscriptOutcome(preview, for: request.outputURL, request: request), preview)
+                return savingCorrectedTranscript(preview, request: request)
             }
             let failure = makeTranscriptionFailure(
                 phase: .finalTranscription,
@@ -1969,6 +1977,7 @@ final class AudioRecorderViewModel: ObservableObject {
 
         do {
             let result = try await transcribeFinalRecording(request, task: effectiveTask)
+                .applyingCorrections(using: dictionaryService)
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else {
                 let failure = makeTranscriptionFailure(
@@ -2592,6 +2601,16 @@ final class AudioRecorderViewModel: ObservableObject {
     private func loadTranscript(for audioURL: URL) -> String? {
         let txtURL = transcriptURL(for: audioURL)
         return try? String(contentsOf: txtURL, encoding: .utf8)
+    }
+
+    /// Saves a live preview or live-session text that stands in for the final
+    /// transcript, with the Dictionary's corrections, and returns the saved text.
+    private func savingCorrectedTranscript(
+        _ text: String,
+        request: FinalTranscriptionRequest
+    ) -> (outcome: FinalTranscriptionOutcome, previewText: String) {
+        let corrected = dictionaryService.applyCorrections(to: text)
+        return (saveTranscriptOutcome(corrected, for: request.outputURL, request: request), corrected)
     }
 
     private func saveTranscriptOutcome(

@@ -384,6 +384,102 @@ final class AudioRecorderViewModelTests: XCTestCase {
         XCTAssertEqual(transcripts.count, 1)
     }
 
+    func testRecorderTranscriptAndSpeakerRecordCarryDictionaryCorrections() async throws {
+        try preserveStandardDefaults()
+        setupPluginManager(groqBehavior: .timed(
+            text: "Agentree runs the build. Ship Agentree today.",
+            segments: [
+                PluginTranscriptionSegment(text: "Agentree runs the build.", start: 0, end: 0.4),
+                PluginTranscriptionSegment(text: "Ship Agentree today.", start: 0.5, end: 0.9),
+            ],
+            words: []
+        ))
+        let modelManager = ModelManagerService()
+        modelManager.selectProvider("groq")
+        let dictionary = DictionaryService(appSupportDirectory: makeTemporaryDirectory())
+        dictionary.addEntry(type: .correction, original: "Agentree", replacement: "Agentry", caseSensitive: true)
+        let viewModel = makeFinalTranscriptionViewModel(
+            defaults: try makeDefaults(),
+            modelManager: modelManager,
+            dictionaryService: dictionary
+        )
+        viewModel.detectSpeakers = true
+        var inputs: [SpeakerRecordingInput] = []
+        viewModel.speakerRecordIntake = { input in
+            inputs.append(input)
+            return UUID()
+        }
+        var events: [RecorderTranscriptReadyPayload] = []
+        EventBus.shared.emissionObserverForTesting = { event in
+            guard case .recorderTranscriptReady(let payload) = event else { return }
+            events.append(payload)
+        }
+
+        let sessionID = try await viewModel.apiStartRecording(micEnabled: true, systemAudioEnabled: false)
+        _ = try viewModel.apiStopRecording()
+        let session = try await waitForRecorderSession(viewModel, id: sessionID, status: .completed)
+
+        let corrected = "Agentry runs the build. Ship Agentry today."
+        XCTAssertEqual(session.text, corrected)
+        let event = try XCTUnwrap(events.first)
+        XCTAssertEqual(event.text, corrected)
+        XCTAssertEqual(try String(contentsOfFile: event.transcriptFilePath, encoding: .utf8), corrected)
+        let input = try XCTUnwrap(inputs.first)
+        XCTAssertEqual(input.result.text, corrected)
+        XCTAssertEqual(input.result.segments.map(\.text), ["Agentry runs the build.", "Ship Agentry today."])
+    }
+
+    func testLivePreviewStandingInForTheTranscriptCarriesDictionaryCorrections() async throws {
+        try preserveStandardDefaults()
+        let dictionary = DictionaryService(appSupportDirectory: makeTemporaryDirectory())
+        dictionary.addEntry(type: .correction, original: "Agentree", replacement: "Agentry", caseSensitive: true)
+        let viewModel = makeViewModel(
+            defaults: try makeDefaults(),
+            recorderService: makeRecorderService(recordingsDirectory: makeTemporaryDirectory()),
+            dictionaryService: dictionary
+        )
+        viewModel.transcriptionEnabled = false
+        viewModel.livePreviewEnabled = true
+
+        let sessionID = try await viewModel.apiStartRecording(micEnabled: true, systemAudioEnabled: false)
+        viewModel.partialText = "Ship Agentree today."
+        _ = try viewModel.apiStopRecording()
+
+        let session = try await waitForRecorderSession(viewModel, id: sessionID, status: .completed)
+        XCTAssertEqual(session.text, "Ship Agentry today.")
+    }
+
+    func testTranscribingARecordingAgainAppliesDictionaryCorrections() async throws {
+        try preserveStandardDefaults()
+        setupPluginManager(groqBehavior: .success("Notes from Agentree"))
+        let modelManager = ModelManagerService()
+        modelManager.selectProvider("groq")
+        let recordingsDirectory = makeTemporaryDirectory()
+        let audioURL = recordingsDirectory.appendingPathComponent("Meeting.wav")
+        let transcriptURL = audioURL.deletingPathExtension().appendingPathExtension("txt")
+        try Data("audio".utf8).write(to: audioURL)
+        try "old transcript".write(to: transcriptURL, atomically: true, encoding: .utf8)
+        let dictionary = DictionaryService(appSupportDirectory: makeTemporaryDirectory())
+        dictionary.addEntry(type: .correction, original: "Agentree", replacement: "Agentry", caseSensitive: true)
+        let viewModel = makeViewModel(
+            defaults: try makeDefaults(),
+            modelManager: modelManager,
+            recorderService: makeRecorderService(recordingsDirectory: recordingsDirectory),
+            dictionaryService: dictionary,
+            audioSamplesLoader: { _ in [0.25, -0.25] }
+        )
+        viewModel.loadRecordings()
+        try await waitForRecordingsToLoad(viewModel, count: 1)
+
+        viewModel.transcribeRecording(try XCTUnwrap(viewModel.recordings.first))
+        try await waitForRetranscriptionToFinish(
+            viewModel,
+            recordingsSatisfy: { $0.recordings.first?.transcript == "Notes from Agentry" }
+        )
+
+        XCTAssertEqual(try String(contentsOf: transcriptURL, encoding: .utf8), "Notes from Agentry")
+    }
+
     func testEarlierTranscriptsAreImportedIntoHistoryOnce() async throws {
         let directory = makeTemporaryDirectory()
         let withID = directory.appendingPathComponent("with-id.wav")
@@ -3558,7 +3654,8 @@ final class AudioRecorderViewModelTests: XCTestCase {
         modelManager: ModelManagerService,
         recordingsDirectory: URL? = nil,
         samples: [Float] = Array(repeating: 0.25, count: Int(AudioRecorderService.transcriptionSampleRate)),
-        speechRegionDetector: any SpeechRegionDetecting = WholeRecordingSpeechDetector()
+        speechRegionDetector: any SpeechRegionDetecting = WholeRecordingSpeechDetector(),
+        dictionaryService: DictionaryService? = nil
     ) -> AudioRecorderViewModel {
         let recorderService = makeRecorderService(
             recordingsDirectory: recordingsDirectory ?? makeTemporaryDirectory(),
@@ -3568,6 +3665,7 @@ final class AudioRecorderViewModelTests: XCTestCase {
             defaults: defaults,
             modelManager: modelManager,
             recorderService: recorderService,
+            dictionaryService: dictionaryService,
             speechRegionDetector: speechRegionDetector
         )
         viewModel.transcriptionEnabled = true
