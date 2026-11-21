@@ -85,6 +85,36 @@ final class CalendarMeetingRecordingTests: XCTestCase {
         XCTAssertEqual(result.lastPathComponent, "Planning 3.wav")
     }
 
+    func testNameStaysTakenWhileAnEarlierRecordingsFilesRemainWithoutItsAudio() {
+        let directory = URL(fileURLWithPath: "/tmp/calendar-recordings", isDirectory: true)
+        // The audio of earlier recordings was moved away; their transcripts and IDs stayed.
+        let occupied: Set<String> = [
+            directory.appendingPathComponent("Daily.wav.recording-id.json").path,
+            directory.appendingPathComponent("Daily.wav.transcript-ready.json").path,
+            directory.appendingPathComponent("Daily 2.txt").path,
+            directory.appendingPathComponent("Daily 3.timestamps.json").path,
+        ]
+
+        let result = CalendarMeetingRecordingFilename.availableURL(
+            in: directory,
+            preferredBaseName: "Daily",
+            fileExtension: "wav",
+            fileExists: { occupied.contains($0) }
+        )
+
+        XCTAssertEqual(result.lastPathComponent, "Daily 4.wav")
+
+        // An earlier `.m4a` recording without a transcript yet also holds the name for a `.wav`.
+        let otherFormat: Set<String> = [directory.appendingPathComponent("Standup.m4a").path]
+        let wav = CalendarMeetingRecordingFilename.availableURL(
+            in: directory,
+            preferredBaseName: "Standup",
+            fileExtension: "wav",
+            fileExists: { otherFormat.contains($0) }
+        )
+        XCTAssertEqual(wav.lastPathComponent, "Standup 2.wav")
+    }
+
     func testRecorderBridgeOnlyAcceptsCurrentCalendarHandleAndManualStopInvalidatesIt() async throws {
         let suiteName = "CalendarMeetingRecordingTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

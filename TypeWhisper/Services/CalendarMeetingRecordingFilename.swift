@@ -43,11 +43,38 @@ enum CalendarMeetingRecordingFilename {
             let candidate = directory
                 .appendingPathComponent(candidateName)
                 .appendingPathExtension(fileExtension)
-            if !fileExists(candidate.path) {
+            // The audio may exist in another Recorder format (`X.m4a` beside a new `X.wav`):
+            // both would write `X.txt`.
+            let audioURLs = AudioRecorderService.OutputFormat.allCases.map {
+                candidate.deletingPathExtension().appendingPathExtension($0.fileExtension)
+            }
+            let taken = ([candidate] + audioURLs).contains { url in
+                recordingFileURLs(for: url).contains(where: { fileExists($0.path) })
+            }
+            if !taken {
                 return candidate
             }
             suffix += 1
         }
+    }
+
+    /// The audio file and the files the Recorder keeps beside it (the list
+    /// `AudioRecorderViewModel.deleteRecording` trashes). A name stays taken while any of
+    /// them exists: a new recording at that name would otherwise read the earlier
+    /// recording's `recording_id` and overwrite its transcript and receipt after the
+    /// audio was moved or deleted outside the app (#1774).
+    private static func recordingFileURLs(for audioURL: URL) -> [URL] {
+        let baseURL = audioURL.deletingPathExtension()
+        return [
+            audioURL,
+            baseURL.appendingPathExtension("txt"),
+            baseURL.appendingPathExtension("transcript.md"),
+            baseURL.appendingPathExtension("transcript.json"),
+            audioURL.appendingPathExtension("transcript-ready.json"),
+            audioURL.appendingPathExtension("recording-id.json"),
+            audioURL.appendingPathExtension("transcription-failure.json"),
+            TranscriptTimestampsFile.url(besideAudio: audioURL),
+        ]
     }
 
     private static func sanitizeTitle(_ title: String) -> String {
