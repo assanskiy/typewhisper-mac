@@ -1,0 +1,108 @@
+# Fork-only: unsigned macOS build of a fork branch with upstream's own toolchain and setup scripts.
+name: fork-check
+
+on:
+  push:
+    branches: [fork]
+  # A pr/* branch carries no fork tooling: dispatch on `fork` with `ref: pr/<branch>`.
+  workflow_dispatch:
+    inputs:
+      ref:
+        type: string
+        required: false
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-check-${{ inputs.ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  SCHEME: TypeWhisper
+  PROJECT: TypeWhisper.xcodeproj
+
+jobs:
+  delta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: .fork-tooling
+          sparse-checkout: fork
+          persist-credentials: false
+      - name: Delta trailers
+        env:
+          REF: ${{ inputs.ref || github.ref_name }}
+        run: |
+          git fetch --no-tags https://github.com/TypeWhisper/typewhisper-mac.git main:refs/remotes/upstream/main
+          python3 .fork-tooling/fork/delta.py --base upstream/main --check
+          case "$REF" in pr/*)
+            n="$(git rev-list --count upstream/main..HEAD)"
+            [ "$n" = 1 ] || { echo "::error::$REF has $n commits over upstream main, expected 1"; exit 1; } ;;
+          esac
+
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+      - name: Xcode version from upstream build.yml
+        id: xc
+        run: |
+          echo "version=$(sed -n 's/^  XCODE_VERSION: "\(.*\)"$/\1/p' .github/workflows/build.yml)" | tee -a "$GITHUB_OUTPUT"
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: ${{ steps.xc.outputs.version }}
+      - name: Toolchain and binaries
+        run: |
+          bash scripts/ensure_metal_toolchain.sh
+          bash scripts/seed_onnxruntime_artifacts.sh
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/SourcePackages
+          key: spm-${{ runner.os }}-xcode${{ steps.xc.outputs.version }}-${{ hashFiles('TypeWhisper.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-xcode${{ steps.xc.outputs.version }}-
+      - name: Resolve packages
+        run: |
+          for attempt in 1 2 3; do
+            xcodebuild -resolvePackageDependencies -project $PROJECT -scheme $SCHEME \
+              -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" && exit 0
+            sleep 10
+          done
+          exit 1
+      - name: Build
+        run: |
+          set -o pipefail
+          xcodebuild -skipPackagePluginValidation -project $PROJECT -scheme $SCHEME \
+            -configuration Release -derivedDataPath build \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
+            -destination 'generic/platform=macOS' ARCHS=arm64 \
+            ENABLE_CODE_COVERAGE=NO CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            | tee build.log
+      - name: Unit tests
+        run: |
+          set -o pipefail
+          xcodebuild test -skipPackagePluginValidation -project $PROJECT -scheme $SCHEME \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
+            -destination 'platform=macOS,arch=arm64' -parallel-testing-enabled NO \
+            COMPILER_INDEX_STORE_ENABLE=NO CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            | tee test.log
+      - name: First-party warnings
+        run: |
+          bash scripts/check_first_party_warnings.sh build.log
+          bash scripts/check_first_party_warnings.sh test.log
