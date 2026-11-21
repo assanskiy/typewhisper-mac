@@ -26,7 +26,7 @@ A maintainer-edited version conflicts instead: the job stops, leaves `fork` unto
 
 ## Adding a change
 
-1. Branch `pr/<issue>-<slug>` from `main`, one commit, title by upstream `AGENTS.md` § Pull Requests, body with Context, Change, Test plan, `Closes #<n>`, trailers above.
+1. An open upstream PR on the issue (comments, `refs/pull/*`) → cherry-pick it onto `fork` with `Upstream-PR: #<n>` and stop. Else branch `pr/<issue>-<slug>` from `main`, one commit, title by upstream `AGENTS.md` § Pull Requests, body with Context, Change, Test plan, `Closes #<n>`, trailers above.
 2. Push the branch: `fork-check.yml` compiles it on macOS.
 3. Cherry-pick the commit onto `fork`.
 4. Open the upstream PR from the `pr/*` branch (Artur's GitHub account; upstream `pr-description.yml` rules apply).
