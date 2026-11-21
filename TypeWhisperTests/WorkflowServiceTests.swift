@@ -1317,6 +1317,188 @@ final class WorkflowServiceTests: XCTestCase {
         )
     }
 
+    // MARK: - Implausible LLM output (#1802)
+
+    /// An 85-character dictation from #1802 that a reasoning model answered with its reasoning.
+    private static let leakDictation = "Все-таки можем ли мы сделать так, чтобы такие сообщения отправлялись в Slack или нет?"
+    /// Shortened from the 2,964 characters of #1802: plain text, no `<think>` tags.
+    private static let leakedReasoning = """
+    "Slack" does not appear in the provided glossary or protected vocabulary, so it stays as dictated. \
+    The instructions say to keep Latin terms in Latin script and not to translate. \
+    Wait, looking at the protected vocabulary again, there is no entry for Slack, but it is a product name, so it keeps its spelling. \
+    The dictation is a question, so it must stay a question and must not be answered. \
+    Let's clean up: "Все-таки" is fine, the comma before "чтобы" is needed, and the question mark stays. \
+    Result: Всё-таки можем ли мы сделать так, чтобы такие сообщения отправлялись в Slack, или нет?
+    """
+    /// A dictated request from #1802 that the model answered with "Understood.".
+    private static let requestDictation = "Подумай, пожалуйста, какие тут могут быть сценарии использования, и напиши SQL-запрос, который посчитает их по каждому пользователю за месяц."
+    /// A 150-character dictation for a custom cleanup workflow, as the reporter uses.
+    static let customDictation = "Слушай, посмотри, почему диктовка в Slack порой приходит на английском, и проверь, пожалуйста, что воркер не теряет последние слова при длинной записи"
+    /// Untagged reasoning of the leak's full length, 2,964 characters.
+    static let fullLeakedReasoning = String(String(
+        repeating: "The user wants the dictation cleaned up, so I keep every word, the glossary terms and the verb forms, and fix only punctuation and recognition errors. ",
+        count: 20
+    ).prefix(2964))
+    /// A terse dictation that a custom "dictation to agent prompt" workflow spells out.
+    private static let promptDictation = "сохранение: серая? что пишет? скажи до правок"
+    private static let promptExpansion = """
+    Look at the Save button on this screen.
+
+    1. Check whether it stays disabled while the form is valid, and why.
+    2. Check whether it saves the latest changes or an older version of the form.
+    3. Tell me what you find before you change anything in the code.
+    """
+
+    func testLLMReasoningTextRemovesThinkBlocks() {
+        XCTAssertEqual(
+            LLMReasoningText.removingThinkBlocks("<think>\nThe user wants a cleanup.\n</think>\n\nHallo Welt."),
+            "Hallo Welt."
+        )
+        XCTAssertEqual(LLMReasoningText.removingThinkBlocks("plan only\n</think>\n\nResult"), "Result")
+        // A closing tag without an opening one drops the text before it only when it ends
+        // its line and an answer follows; otherwise it may be dictated content.
+        XCTAssertEqual(
+            LLMReasoningText.removingThinkBlocks("Close the block with </think> and then write the answer."),
+            "Close the block with </think> and then write the answer."
+        )
+        XCTAssertEqual(LLMReasoningText.removingThinkBlocks("The tag is </think>\n"), "The tag is </think>")
+        XCTAssertEqual(LLMReasoningText.removingThinkBlocks("<THINK>a</THINK> One <think>b</think>two"), "One two")
+        XCTAssertEqual(LLMReasoningText.removingThinkBlocks("<think>Still reasoning when the budget ran out"), "")
+        // An unterminated tag inside the text may be dictated content.
+        XCTAssertEqual(LLMReasoningText.removingThinkBlocks("Wrap it in a <think> tag."), "Wrap it in a <think> tag.")
+        XCTAssertEqual(LLMReasoningText.removingThinkBlocks("Plain answer.\n"), "Plain answer.\n")
+        XCTAssertTrue(LLMReasoningText.isReasoningOnly("<think>Still reasoning"))
+        XCTAssertTrue(LLMReasoningText.isReasoningOnly(" <think>plan</think>\n"))
+        XCTAssertFalse(LLMReasoningText.isReasoningOnly("<think>plan</think>Result"))
+        XCTAssertFalse(LLMReasoningText.isReasoningOnly("  \n"))
+        XCTAssertFalse(LLMReasoningText.isReasoningOnly("The tag is </think>"))
+    }
+
+    func testWorkflowOutputPlausibilityRejectsTheLeakAndTheAcknowledgementFromTheIssue() {
+        XCTAssertThrowsError(
+            try WorkflowOutputPlausibility.check(output: Self.leakedReasoning, input: Self.leakDictation, check: .cleanup)
+        ) { error in
+            XCTAssertEqual(error as? WorkflowOutputImplausibleError, .tooLong)
+        }
+        // Translation and custom workflows get the looser bound, which the full 2,964-character leak exceeds.
+        for check in [WorkflowOutputCheck.translation, .custom] {
+            XCTAssertThrowsError(
+                try WorkflowOutputPlausibility.check(output: Self.fullLeakedReasoning, input: Self.customDictation, check: check)
+            ) { error in
+                XCTAssertEqual(error as? WorkflowOutputImplausibleError, .tooLong)
+            }
+        }
+        for check in [WorkflowOutputCheck.cleanup, .translation, .transformation] {
+            XCTAssertThrowsError(
+                try WorkflowOutputPlausibility.check(output: "Understood.", input: Self.requestDictation, check: check)
+            ) { error in
+                XCTAssertEqual(error as? WorkflowOutputImplausibleError, .acknowledgement)
+            }
+        }
+    }
+
+    func testTranslationBoundAcceptsAChineseToEnglishTranslation() throws {
+        // Chinese into English grows 3-4x in characters: 450 is within 5x + 300 but beyond 3x + 100.
+        let dictation = "今天下午的会议改到三点半了，请大家提前准备好上个季度的销售数据和客户反馈，另外别忘了把新产品的演示文稿发给我，我想在会前先看一遍，如果有人那天下午没有时间，请今天之内告诉我，我会另外安排一次简短的说明，谢谢大家的配合。"
+        let translation = "The meeting this afternoon has been moved to half past three, so please prepare last quarter's sales figures and the customer feedback ahead of time. Also, do not forget to send me the presentation for the new product, because I would like to read it through before the meeting starts. Thank you all very much for your cooperation and for adjusting your schedules at such short notice. If anyone cannot make it, please let me know today, and I will arrange a short briefing for them."
+        try WorkflowOutputPlausibility.check(output: translation, input: dictation, check: .translation)
+        XCTAssertThrowsError(
+            try WorkflowOutputPlausibility.check(output: translation, input: dictation, check: .cleanup)
+        ) { error in
+            XCTAssertEqual(error as? WorkflowOutputImplausibleError, .tooLong)
+        }
+    }
+
+    func testWorkflowOutputPlausibilityAcceptsOrdinaryResults() throws {
+        try WorkflowOutputPlausibility.check(
+            output: "Всё-таки можем ли мы сделать так, чтобы такие сообщения отправлялись в Slack, или нет?",
+            input: Self.leakDictation,
+            check: .cleanup
+        )
+        // A cleanup collapses an engine's repetition loop to one sentence.
+        let loop = Array(repeating: "Thank you.", count: 20).joined(separator: " ")
+        try WorkflowOutputPlausibility.check(output: "Thank you.", input: loop, check: .cleanup)
+        // Short dictations may change a lot in relative terms or be an acknowledgement themselves.
+        try WorkflowOutputPlausibility.check(output: "Okay, sounds good to me.", input: "ok", check: .cleanup)
+        try WorkflowOutputPlausibility.check(output: "Understood.", input: "understood", check: .cleanup)
+        // Empty output keeps the provider chain's own handling.
+        try WorkflowOutputPlausibility.check(output: "", input: Self.requestDictation, check: .cleanup)
+        // Inline Commands may change the length; replies and custom instructions may answer "Sure.".
+        try WorkflowOutputPlausibility.check(output: Self.leakedReasoning, input: Self.leakDictation, check: .transformation)
+        try WorkflowOutputPlausibility.check(output: "Sure.", input: Self.requestDictation, check: .unchecked)
+        try WorkflowOutputPlausibility.check(output: "Understood.", input: Self.requestDictation, check: .custom)
+        // A custom instruction may expand a terse dictation beyond the Cleaned Text bound.
+        XCTAssertThrowsError(
+            try WorkflowOutputPlausibility.check(output: Self.promptExpansion, input: Self.promptDictation, check: .cleanup)
+        )
+        try WorkflowOutputPlausibility.check(output: Self.promptExpansion, input: Self.promptDictation, check: .custom)
+    }
+
+    func testWorkflowOutputCheckMatchesTheTemplate() {
+        XCTAssertEqual(WorkflowOutputCheck(template: .cleanedText), .cleanup)
+        XCTAssertEqual(WorkflowOutputCheck(template: .translation), .translation)
+        XCTAssertEqual(WorkflowOutputCheck(template: .dictation), .transformation)
+        XCTAssertEqual(WorkflowOutputCheck(template: .custom), .custom)
+        for template in [WorkflowTemplate.emailReply, .meetingNotes, .checklist, .json, .summary] {
+            XCTAssertEqual(WorkflowOutputCheck(template: template), .unchecked, template.rawValue)
+        }
+    }
+
+    func testDictationWorkflowsRejectImplausibleAnswersAndCustomWorkflowsKeepShortOnes() async throws {
+        let cleanup = Workflow(name: "Clean", template: .cleanedText, trigger: .manual())
+        let inline = Workflow(
+            name: "Inline", template: .dictation, trigger: .manual(),
+            behavior: WorkflowBehavior(inlineCommandsEnabled: true)
+        )
+        let custom = Workflow(
+            name: "Reply", template: .custom, trigger: .manual(),
+            behavior: WorkflowBehavior(fineTuning: "Answer the message in one word.")
+        )
+        var reply = Self.leakedReasoning
+        let service = WorkflowTextProcessingService(
+            promptProcessor: { _, _, _, _, _ in reply },
+            appleTranslator: nil
+        )
+
+        do {
+            _ = try await service.process(workflow: cleanup, text: Self.leakDictation)
+            XCTFail("Expected the leaked reasoning to be rejected")
+        } catch {
+            XCTAssertEqual(error as? WorkflowOutputImplausibleError, .tooLong)
+        }
+
+        reply = "Understood."
+        for workflow in [cleanup, inline] {
+            do {
+                _ = try await service.process(workflow: workflow, text: Self.requestDictation)
+                XCTFail("Expected the acknowledgement to be rejected: \(workflow.name)")
+            } catch {
+                XCTAssertEqual(error as? WorkflowOutputImplausibleError, .acknowledgement, workflow.name)
+            }
+        }
+
+        reply = "Sure."
+        XCTAssertNotNil(service.systemPrompt(workflow: custom))
+        let answer = try await service.process(workflow: custom, text: Self.requestDictation)
+        XCTAssertEqual(answer, "Sure.")
+
+        reply = Self.fullLeakedReasoning
+        do {
+            _ = try await service.process(workflow: custom, text: Self.customDictation)
+            XCTFail("Expected the runaway answer of a custom workflow to be rejected")
+        } catch {
+            XCTAssertEqual(error as? WorkflowOutputImplausibleError, .tooLong)
+        }
+
+        reply = Self.promptExpansion
+        let expanded = try await service.process(workflow: custom, text: Self.promptDictation)
+        XCTAssertEqual(expanded, Self.promptExpansion)
+
+        reply = "Всё-таки можем ли мы сделать так, чтобы такие сообщения отправлялись в Slack, или нет?"
+        let cleaned = try await service.process(workflow: cleanup, text: Self.leakDictation)
+        XCTAssertEqual(cleaned, reply)
+    }
+
     func testAllWorkflowSystemPromptsIncludeInputBoundary() throws {
         let templates: [(template: WorkflowTemplate, behavior: WorkflowBehavior)] = [
             (.cleanedText, WorkflowBehavior()),
@@ -1972,6 +2154,38 @@ final class WorkflowServiceTests: XCTestCase {
             XCTFail("Expected the cancellation to propagate")
         } catch {
             XCTAssertTrue(error is CancellationError)
+        }
+    }
+
+    func testLLMTranslationFallsBackToAppleTranslateWhenTheAnswerRunsAway() async throws {
+        let workflow = Workflow(
+            name: "LLM Translate",
+            template: .translation,
+            trigger: .manual(),
+            behavior: WorkflowBehavior(settings: ["targetLanguage": "German"])
+        )
+        let dictation = "Hello world, please check the build and tell me what failed."
+        let reasoning = Self.fullLeakedReasoning
+        let service = WorkflowTextProcessingService(
+            promptProcessor: { _, _, _, _, _ in reasoning },
+            appleTranslator: nil,
+            strictAppleTranslator: { text, _, _ in
+                text == dictation ? "Hallo Welt, bitte prüf den Build und sag mir, was fehlgeschlagen ist." : text
+            }
+        )
+
+        let result = try await service.process(workflow: workflow, text: dictation, detectedLanguage: "English")
+        XCTAssertEqual(result, "Hallo Welt, bitte prüf den Build und sag mir, was fehlgeschlagen ist.")
+
+        let withoutApple = WorkflowTextProcessingService(
+            promptProcessor: { _, _, _, _, _ in reasoning },
+            appleTranslator: nil
+        )
+        do {
+            _ = try await withoutApple.process(workflow: workflow, text: dictation)
+            XCTFail("Expected the runaway translation to be rejected")
+        } catch {
+            XCTAssertEqual(error as? WorkflowOutputImplausibleError, .tooLong)
         }
     }
 

@@ -37,6 +37,121 @@ struct WorkflowLLMRequest: Equatable, Sendable {
     /// Set when neither the engine nor the settings named the dictation's language:
     /// each request then guesses it from the text it sends (see `DictatedTextLanguage`).
     var inferredLanguageHintStyle: WorkflowLanguageHintStyle? = nil
+    /// How strictly the answer is checked against the dictation (see `WorkflowOutputPlausibility`).
+    var outputCheck: WorkflowOutputCheck = .unchecked
+}
+
+/// Which plausibility checks a workflow's LLM answer gets. Workflows that transform
+/// the dictation itself reject a bare acknowledgement; a reply or an email may
+/// legitimately answer "Sure." or change the length freely. Custom workflows only
+/// reject a runaway answer, with a looser bound, because their instructions may
+/// answer briefly or expand the dictation.
+enum WorkflowOutputCheck: Equatable, Sendable {
+    case unchecked
+    /// Inline Commands: a bare acknowledgement is rejected.
+    case transformation
+    /// Translation: an acknowledgement or a far longer answer is rejected.
+    case translation
+    /// Cleaned Text, which keeps every word: an acknowledgement or a far longer answer is rejected.
+    case cleanup
+    /// Custom workflows: only an answer many times longer than the dictation is rejected.
+    case custom
+
+    init(template: WorkflowTemplate) {
+        switch template {
+        case .cleanedText:
+            self = .cleanup
+        case .translation:
+            self = .translation
+        case .dictation:
+            self = .transformation
+        case .custom:
+            self = .custom
+        case .emailReply, .meetingNotes, .checklist, .json, .summary:
+            self = .unchecked
+        }
+    }
+
+    var rejectsAcknowledgement: Bool {
+        switch self {
+        case .transformation, .translation, .cleanup:
+            true
+        case .unchecked, .custom:
+            false
+        }
+    }
+
+    /// The longest plausible answer for an input of `inputLength` characters, or nil without a bound.
+    func maximumOutputLength(forInputLength inputLength: Int) -> Int? {
+        switch self {
+        case .cleanup:
+            return inputLength * WorkflowOutputPlausibility.maximumLengthRatio + WorkflowOutputPlausibility.lengthMargin
+        case .translation, .custom:
+            return inputLength * WorkflowOutputPlausibility.customMaximumLengthRatio + WorkflowOutputPlausibility.customLengthMargin
+        case .unchecked, .transformation:
+            return nil
+        }
+    }
+}
+
+/// Why a workflow LLM answer was rejected as something other than the transformed text.
+enum WorkflowOutputImplausibleError: LocalizedError, Equatable {
+    case acknowledgement
+    case tooLong
+
+    var errorDescription: String? {
+        switch self {
+        case .acknowledgement:
+            "The LLM answered the dictation instead of transforming it."
+        case .tooLong:
+            "The LLM output is far longer than the dictation; it is likely the model's reasoning."
+        }
+    }
+}
+
+/// Catches an LLM answer that is not the transformed dictation: a reasoning model
+/// thinking aloud about the prompt, or a reply to a dictated request (#1802). The
+/// workflow step then fails, so the pipeline inserts the raw transcript. There is no
+/// lower length bound: a cleanup rightly collapses an engine's repetition loop.
+enum WorkflowOutputPlausibility {
+    /// Cleaned dictations stay near the input length (0.81-1.01 in the issue's sample of 98),
+    /// while the leaked reasoning was 35 times longer.
+    static let maximumLengthRatio = 3
+    /// Short dictations change more in relative terms (punctuation, casing, a format wrapper).
+    static let lengthMargin = 100
+    /// Looser bound for custom instructions that lengthen a dictation, and for Translation (Chinese
+    /// or Japanese into English grows 3-4x); the 2,964-character leak still exceeds it.
+    static let customMaximumLengthRatio = 5
+    static let customLengthMargin = 300
+    /// A bare acknowledgement only counts as a reply when the dictation was longer than one.
+    static let minimumInputLengthForAcknowledgement = 40
+    /// Lowercased, without surrounding punctuation. English only: the reply in #1802 was
+    /// English for a Russian dictation.
+    static let acknowledgements: Set<String> = [
+        "understood", "ok", "okay", "got it", "sure", "sure thing", "noted",
+        "will do", "certainly", "of course", "i understand", "acknowledged"
+    ]
+
+    static func check(output: String, input: String, check: WorkflowOutputCheck) throws {
+        guard check != .unchecked else { return }
+        let outputText = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        let inputText = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        // An empty answer keeps its own handling: the provider chain confirms it as intended.
+        guard !outputText.isEmpty, !inputText.isEmpty else { return }
+
+        if check.rejectsAcknowledgement,
+           inputText.count >= minimumInputLengthForAcknowledgement,
+           acknowledgements.contains(
+               outputText.lowercased().trimmingCharacters(in: CharacterSet.punctuationCharacters.union(.whitespacesAndNewlines))
+           ) {
+            throw WorkflowOutputImplausibleError.acknowledgement
+        }
+
+        if let maximumLength = check.maximumOutputLength(forInputLength: inputText.count),
+           outputText.count > maximumLength {
+            throw WorkflowOutputImplausibleError.tooLong
+        }
+    }
 }
 
 /// Guesses the language of dictated text for a workflow prompt. Engines such as
@@ -198,8 +313,9 @@ struct WorkflowTextProcessingService {
             let behavior = workflow.behavior
             let prompt = inlineCommandPrompt(workflow: workflow, resolvedOutputFormat: resolvedOutputFormat)
                 + screenContextBlock
+            let output: String
             if let effortPromptProcessor {
-                return try await effortPromptProcessor(
+                output = try await effortPromptProcessor(
                     prompt,
                     text,
                     Self.trimmedOrNil(behavior.providerId),
@@ -207,14 +323,16 @@ struct WorkflowTextProcessingService {
                     behavior.temperatureDirective,
                     Self.trimmedOrNil(behavior.effortId)
                 )
+            } else {
+                output = try await promptProcessor(
+                    prompt,
+                    text,
+                    Self.trimmedOrNil(behavior.providerId),
+                    Self.trimmedOrNil(behavior.cloudModel),
+                    behavior.temperatureDirective
+                )
             }
-            return try await promptProcessor(
-                prompt,
-                text,
-                Self.trimmedOrNil(behavior.providerId),
-                Self.trimmedOrNil(behavior.cloudModel),
-                behavior.temperatureDirective
-            )
+            return try Self.checked(output, input: text, check: .transformation)
         }
 
         if workflow.usesAppleTranslate {
@@ -244,7 +362,8 @@ struct WorkflowTextProcessingService {
                 temperatureDirective: request.temperatureDirective,
                 effortId: request.effortId,
                 providerResolution: request.providerResolution,
-                inferredLanguageHintStyle: request.inferredLanguageHintStyle
+                inferredLanguageHintStyle: request.inferredLanguageHintStyle,
+                outputCheck: request.outputCheck
             )
         }
 
@@ -343,10 +462,12 @@ struct WorkflowTextProcessingService {
 
     /// Sends `text` through the same provider path as whole-text workflow processing,
     /// including per-workflow overrides and the global LLM fallback list.
+    /// Throws `WorkflowOutputImplausibleError` for an answer that is not the transformed text.
     func process(request: WorkflowLLMRequest, text: String) async throws -> String {
         let systemPrompt = Self.systemPrompt(of: request, for: text)
+        let output: String
         if let effortPromptProcessor {
-            return try await effortPromptProcessor(
+            output = try await effortPromptProcessor(
                 systemPrompt,
                 text,
                 request.providerId,
@@ -354,14 +475,29 @@ struct WorkflowTextProcessingService {
                 request.temperatureDirective,
                 request.effortId
             )
+        } else {
+            output = try await promptProcessor(
+                systemPrompt,
+                text,
+                request.providerId,
+                request.cloudModel,
+                request.temperatureDirective
+            )
         }
-        return try await promptProcessor(
-            systemPrompt,
-            text,
-            request.providerId,
-            request.cloudModel,
-            request.temperatureDirective
-        )
+        return try Self.checked(output, input: text, check: request.outputCheck)
+    }
+
+    /// `output`, or `WorkflowOutputImplausibleError` when it is not the transformed `input`.
+    private static func checked(_ output: String, input: String, check: WorkflowOutputCheck) throws -> String {
+        do {
+            try WorkflowOutputPlausibility.check(output: output, input: input, check: check)
+        } catch {
+            workflowTextProcessingLogger.warning(
+                "Rejected LLM output of \(output.count, privacy: .public) characters for \(input.count, privacy: .public) input characters: \(error.localizedDescription, privacy: .public)"
+            )
+            throw error
+        }
+        return output
     }
 
     /// The request's system prompt for `text`, with the language guessed from `text`
@@ -427,7 +563,8 @@ struct WorkflowTextProcessingService {
             effortId: Self.trimmedOrNil(behavior.effortId),
             inferredLanguageHintStyle: languageIsUnknown && workflow.infersLanguageFromDictation
                 ? workflow.languageHintStyle
-                : nil
+                : nil,
+            outputCheck: WorkflowOutputCheck(template: workflow.template)
         )
     }
 

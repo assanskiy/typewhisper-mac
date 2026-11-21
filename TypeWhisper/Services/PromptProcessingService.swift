@@ -98,6 +98,8 @@ struct LLMFallbackExhaustedError: LocalizedError, Equatable {
 
 private enum LLMFallbackAttemptError: LocalizedError {
     case emptyResult
+    /// Only a `<think>` block: a failure, never a vote for intentionally empty output.
+    case reasoningOnly
     case modelUnavailable(String)
     case effortUnavailable(String)
 
@@ -105,6 +107,8 @@ private enum LLMFallbackAttemptError: LocalizedError {
         switch self {
         case .emptyResult:
             "The LLM returned an empty result."
+        case .reasoningOnly:
+            "The LLM returned only its reasoning."
         case .modelUnavailable(let modelId):
             "The selected model \(modelId) is not available for this provider."
         case .effortUnavailable(let effortId):
@@ -680,7 +684,7 @@ class PromptProcessingService: ObservableObject {
                 )
                 try Task.checkCancellation()
 
-                let result = outputText(
+                let result = try answerText(
                     providerResult,
                     for: processingKind,
                     providerId: providerId
@@ -708,7 +712,7 @@ class PromptProcessingService: ObservableObject {
                             }
                         )
                         try Task.checkCancellation()
-                        let retryText = outputText(retryResult, for: processingKind, providerId: providerId)
+                        let retryText = try answerText(retryResult, for: processingKind, providerId: providerId)
                         if retryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             logger.info("Explicit provider returned empty twice; treating empty output as intentional")
                             return ""
@@ -796,7 +800,7 @@ class PromptProcessingService: ObservableObject {
                     }
                 )
                 try Task.checkCancellation()
-                let retryText = outputText(retryResult, for: processingKind, providerId: retryProviderId)
+                let retryText = try answerText(retryResult, for: processingKind, providerId: retryProviderId)
                 if retryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     logger.info("Empty output confirmed by retry; treating empty output as intentional")
                     return ""
@@ -1589,19 +1593,33 @@ class PromptProcessingService: ObservableObject {
         }
     }
 
+    /// The text of a provider's answer. An answer that held only reasoning fails the
+    /// attempt, so it is never confirmed as intentionally empty output.
+    private func answerText(
+        _ result: String,
+        for processingKind: ProcessingKind,
+        providerId: String
+    ) throws -> String {
+        if LLMReasoningText.isReasoningOnly(result) {
+            throw LLMFallbackAttemptError.reasoningOnly
+        }
+        return outputText(result, for: processingKind, providerId: providerId)
+    }
+
     private func outputText(
         _ result: String,
         for processingKind: ProcessingKind,
         providerId: String
     ) -> String {
+        let answer = LLMReasoningText.removingThinkBlocks(result)
         switch processingKind {
         case .prompt:
-            result
+            return answer
         case .workflow(let originalText):
-            providerId == Self.appleIntelligenceId
-                ? result
+            return providerId == Self.appleIntelligenceId
+                ? answer
                 : TypeWhisperDictatedTextBoundary.sanitize(
-                    result,
+                    answer,
                     originalUserText: originalText,
                     fallbackToOriginalUserText: false
                 )
