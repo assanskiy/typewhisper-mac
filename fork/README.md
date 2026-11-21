@@ -26,10 +26,11 @@ A maintainer-edited version conflicts instead: the job stops, leaves `fork` unto
 
 ## Adding a change
 
-1. An open upstream PR on the issue (comments, `refs/pull/*`) → cherry-pick it onto `fork` with `Upstream-PR: #<n>` and stop. Else branch `pr/<issue>-<slug>` from `main`, one commit, title by upstream `AGENTS.md` § Pull Requests, body with Context, Change, Test plan, `Closes #<n>`, trailers above.
-2. Push the branch: `fork-check.yml` compiles it on macOS.
-3. Cherry-pick the commit onto `fork`.
-4. Open the upstream PR from the `pr/*` branch (Artur's GitHub account; upstream `pr-description.yml` rules apply).
+1. Labels `needs discussion` or `effort: large` → a design comment on the issue first (decisions the maintainer must make, a sketch, a smaller first PR); code after his answer.
+2. An open upstream PR on the issue (comments, `refs/pull/*`) → cherry-pick it onto `fork` with `Upstream-PR: #<n>` and stop. Else branch `pr/<issue>-<slug>` from `main`, one commit, title by upstream `AGENTS.md` § Pull Requests, body with Context, Change, Test plan, `Closes #<n>`, trailers above.
+3. Push the branch, then dispatch `fork-check.yml` on `fork` with input `ref: pr/<issue>-<slug>`: it compiles and tests it on macOS (a `pr/*` branch holds no fork workflow, so a push alone runs nothing).
+4. Cherry-pick the commit onto `fork`.
+5. Open the upstream PR from the `pr/*` branch (Artur's GitHub account; upstream `pr-description.yml` rules apply).
 
 ## Build
 
