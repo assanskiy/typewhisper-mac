@@ -1097,31 +1097,3 @@ final class FileTranscriptionViewModel: ObservableObject {
         elapsedRefreshDate = Date()
     }
 }
-
-private extension TranscriptionResult {
-    @MainActor
-    func applyingCorrections(using dictionaryService: DictionaryService) -> TranscriptionResult {
-        let correctedTexts = dictionaryService.applyCorrections(
-            to: [text] + segments.map(\.text)
-        )
-        let correctedSegments = zip(segments, correctedTexts.dropFirst()).map { segment, correctedText in
-            TranscriptionSegment(
-                text: correctedText,
-                start: segment.start,
-                end: segment.end,
-                speakerLabel: segment.speakerLabel,
-                speakerConfidence: segment.speakerConfidence
-            )
-        }
-
-        return TranscriptionResult(
-            text: correctedTexts.first ?? text,
-            detectedLanguage: detectedLanguage,
-            duration: duration,
-            processingTime: processingTime,
-            engineUsed: engineUsed,
-            segments: correctedSegments,
-            words: words
-        )
-    }
-}
