@@ -17554,6 +17554,64 @@ final class TypeWhisperIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    func testWorkflowProcessingStripsThinkBlocksAndFallsBackAfterReasoningOnlyResult() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+        let isolatedDefaults = Self.makeEmptyLLMFallbackDefaults()
+        defer { isolatedDefaults.defaults.removePersistentDomain(forName: isolatedDefaults.suiteName) }
+
+        let reasoningOnly = MockLLMProviderPlugin()
+        reasoningOnly.configuredProviderId = "reasoning-only"
+        reasoningOnly.queuedProcessOutcomes = [.response("<think>The user wants a cleanup.</think>")]
+        let reasoningFirst = MockLLMProviderPlugin()
+        reasoningFirst.configuredProviderId = "reasoning-first"
+        reasoningFirst.queuedProcessOutcomes = [.response("<think>Keep German.</think>\n\nusable workflow result")]
+
+        Self.installLLMFallbackTestProviders([reasoningOnly, reasoningFirst], appSupportDirectory: appSupportDirectory)
+        let service = PromptProcessingService(userDefaults: isolatedDefaults.defaults)
+        service.addLLMFallback(providerId: reasoningOnly.providerId)
+        service.addLLMFallback(providerId: reasoningFirst.providerId)
+
+        let result = try await service.processWorkflow(
+            prompt: "Fix grammar",
+            text: "hello world",
+            behavior: WorkflowBehavior()
+        )
+
+        XCTAssertEqual(result, "usable workflow result")
+        XCTAssertEqual(reasoningOnly.processCallCount, 1)
+        XCTAssertEqual(reasoningFirst.processCallCount, 1)
+    }
+
+    @MainActor
+    func testExplicitWorkflowProviderFailsOnReasoningOnlyResultInsteadOfReturningEmpty() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+        let isolatedDefaults = Self.makeEmptyLLMFallbackDefaults()
+        defer { isolatedDefaults.defaults.removePersistentDomain(forName: isolatedDefaults.suiteName) }
+
+        // Empty twice from an explicit provider is intentional output; reasoning only is not.
+        let explicit = MockLLMProviderPlugin()
+        explicit.configuredProviderId = "explicit-reasoning"
+        explicit.queuedProcessOutcomes = [.response("<think>Still reasoning when the budget ran out")]
+
+        Self.installLLMFallbackTestProviders([explicit], appSupportDirectory: appSupportDirectory)
+        let service = PromptProcessingService(userDefaults: isolatedDefaults.defaults)
+
+        do {
+            let result = try await service.processWorkflow(
+                prompt: "Fix grammar",
+                text: "hello world",
+                behavior: WorkflowBehavior(providerId: explicit.providerId)
+            )
+            XCTFail("Expected a failure for a reasoning-only answer, got \(result.debugDescription)")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "The LLM returned only its reasoning.")
+        }
+        XCTAssertEqual(explicit.processCallCount, 1)
+    }
+
+    @MainActor
     func testPromptProcessingReportsAggregateErrorAfterFallbackListExhaustion() async throws {
         let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
         defer { TestSupport.remove(appSupportDirectory) }

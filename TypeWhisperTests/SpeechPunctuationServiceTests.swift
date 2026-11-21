@@ -970,6 +970,46 @@ final class SpeechPunctuationServiceTests: XCTestCase {
     }
 
     @MainActor
+    func testPipelineInsertsRawTranscriptWhenACustomWorkflowAnswersWithItsReasoning() async throws {
+        let appSupportDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: appSupportDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
+
+        let pipeline = makePipeline(appSupportDirectory: appSupportDirectory)
+        let rawText = WorkflowServiceTests.customDictation
+        let reasoning = WorkflowServiceTests.fullLeakedReasoning
+        XCTAssertEqual(rawText.count, 150)
+        XCTAssertEqual(reasoning.count, 2964)
+        let workflow = Workflow(
+            name: "Диктовка RU", template: .custom, trigger: .manual(),
+            behavior: WorkflowBehavior(settings: ["instruction": "You edit my dictated text."])
+        )
+        let service = WorkflowTextProcessingService(
+            promptProcessor: { _, _, _, _, _ in reasoning },
+            appleTranslator: nil
+        )
+
+        let result = try await pipeline.process(
+            text: rawText,
+            context: PostProcessingContext(language: "ru"),
+            llmHandler: { text in try await service.process(workflow: workflow, text: text) },
+            llmStepName: "Workflow",
+            normalizeNumbers: false,
+            llmFailureFallbackText: rawText
+        )
+
+        XCTAssertEqual(result.text, rawText)
+        XCTAssertEqual(
+            result.fallback,
+            PostProcessingFallback(
+                failedStep: "Workflow",
+                reason: WorkflowOutputImplausibleError.tooLong.localizedDescription
+            )
+        )
+    }
+
+    @MainActor
     func testPipelineDoesNotTreatCancellationAsRawFallback() async throws {
         let appSupportDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

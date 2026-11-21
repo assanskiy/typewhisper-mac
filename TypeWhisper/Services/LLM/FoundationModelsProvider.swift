@@ -171,6 +171,44 @@ enum TypeWhisperDictatedTextBoundary {
     }
 }
 
+/// Removes a reasoning model's `<think>…</think>` blocks from its answer. Hosted
+/// reasoning models (Groq, OpenAI Compatible servers) can return their reasoning
+/// inside the message text, and it is never the requested result (#1802).
+enum LLMReasoningText {
+    static func removingThinkBlocks(_ text: String) -> String {
+        guard text.range(of: "think>", options: .caseInsensitive) != nil else { return text }
+        var result = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Chat templates that open the block themselves leave only the closing tag, on its
+        // own line before the answer. A closing tag inside a line, or one with nothing after
+        // it, may be dictated content, so the text before it stays.
+        if let end = result.range(of: "</think>", options: .caseInsensitive),
+           result.range(of: "<think>", options: .caseInsensitive, range: result.startIndex..<end.lowerBound) == nil {
+            let rest = result[end.upperBound...]
+            let answer = rest.trimmingCharacters(in: .whitespacesAndNewlines)
+            if rest.drop(while: { $0 == " " || $0 == "\t" }).first?.isNewline == true, !answer.isEmpty {
+                result = answer
+            }
+        }
+        while let start = result.range(of: "<think>", options: .caseInsensitive) {
+            guard let end = result.range(of: "</think>", options: .caseInsensitive, range: start.upperBound..<result.endIndex) else {
+                // An answer that opens with an unterminated block is reasoning only; a
+                // tag later in the text may be dictated content and stays.
+                if start.lowerBound == result.startIndex { return "" }
+                break
+            }
+            result.removeSubrange(start.lowerBound..<end.upperBound)
+            result = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return result
+    }
+
+    /// Whether the answer had text and all of it was reasoning.
+    static func isReasoningOnly(_ text: String) -> Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && removingThinkBlocks(text).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
 enum AppleIntelligencePromptBuilder {
     static func prompt(for userText: String) -> String {
         """
