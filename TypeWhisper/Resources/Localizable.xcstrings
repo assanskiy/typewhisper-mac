@@ -59032,31 +59032,31 @@
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Bei Anrufen ohne Kalendertermin beginnt der Stopp-Countdown erst nach 90 Sekunden ohne Meeting-Audio. Kurze Unterbrechungen beenden die Aufnahme dadurch nicht."
+            "value" : "Bei Anrufen ohne Kalendertermin beginnt der Stopp-Countdown erst nach 90 Sekunden ohne Meeting-Audio. Kurze Unterbrechungen beenden die Aufnahme dadurch nicht. Gibt die Anruf-App beim Auflegen das Mikrofon frei, beginnt der Countdown schon nach 20 Sekunden."
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Calls without a calendar event allow 90 seconds without meeting audio before the stop countdown begins, so brief interruptions do not end the recording."
+            "value" : "Calls without a calendar event allow 90 seconds without meeting audio before the stop countdown begins, so brief interruptions do not end the recording. When the call app releases the microphone as you hang up, the countdown begins after 20 seconds."
           }
         },
         "es" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "En las llamadas sin evento en el calendario se permiten 90 segundos sin audio de la reunión antes de que empiece la cuenta atrás para detener la grabación, así las interrupciones breves no la terminan."
+            "value" : "En las llamadas sin evento en el calendario se permiten 90 segundos sin audio de la reunión antes de que empiece la cuenta atrás para detener la grabación, así las interrupciones breves no la terminan. Si la app de llamadas libera el micrófono al colgar, la cuenta atrás empieza a los 20 segundos."
           }
         },
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "カレンダーにない通話では、ミーティング音声が90秒間使用されなくなってから停止カウントダウンが始まるため、短い中断で録音が終了することはありません。"
+            "value" : "カレンダーにない通話では、ミーティング音声が90秒間使用されなくなってから停止カウントダウンが始まるため、短い中断で録音が終了することはありません。通話を終えて通話アプリがマイクを解放すると、カウントダウンは20秒後に始まります。"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "对于没有日历事件的通话，连续 90 秒未检测到会议音频活动后，才会开始停止录音的倒计时，避免短暂中断导致录音结束。"
+            "value" : "对于没有日历事件的通话，连续 90 秒未检测到会议音频活动后，才会开始停止录音的倒计时，避免短暂中断导致录音结束。挂断时通话应用释放麦克风，倒计时会在 20 秒后开始。"
           }
         }
       }

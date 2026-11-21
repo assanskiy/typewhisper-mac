@@ -25944,9 +25944,11 @@ extension TypeWhisperIntegrationTests {
             await controller.testingActivity(MeetingActivitySnapshot(capturedAt: now,
                 availability: .available, processes: []))
         }
+        // The call app released the microphone together with the meeting audio, so ad-hoc
+        // calls wait only the 20-second hang-up grace instead of 90 seconds (#1777).
         if adHoc {
             XCTAssertNil(countdown.presentation)
-            now = now.addingTimeInterval(90)
+            now = now.addingTimeInterval(20)
             await controller.testingAdvanceTime()
         }
         if !showsIndicator {

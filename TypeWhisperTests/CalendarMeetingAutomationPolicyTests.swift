@@ -1447,7 +1447,8 @@ extension CalendarMeetingAutomationPolicyTests {
 
     func testAdHocAutoStopWaitsThroughShortGapsAndKeepsContinueVeto() {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
-        let (occurrence, signal) = detectedSession(at: now)
+        // Muted: only the speaker output of the call app is running.
+        let (occurrence, signal) = detectedSession(at: now, input: false, output: true)
         let handle = CalendarMeetingRecordingHandle(id: UUID(), outputURL: URL(fileURLWithPath: "/tmp/ad-hoc.wav"))
         var policy = CalendarMeetingAutomationPolicy()
         _ = policy.reduce(.configure(adHocConfiguration(), occurrences: [occurrence], now: now))
@@ -1465,6 +1466,178 @@ extension CalendarMeetingAutomationPolicyTests {
         XCTAssertTrue(policy.reduce(.userAction(.continueRecording(handle), now: now.addingTimeInterval(181)))
             .contains(.dismissStopCountdown))
         XCTAssertFalse(policy.reduce(.timeAdvanced(now.addingTimeInterval(300))).contains(.stopRecording(handle)))
+    }
+
+    func testAdHocAutoStopWarnsSoonAfterTheCallAppReleasesTheMicrophone() {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let (occurrence, signal) = detectedSession(at: now, provider: .teams, input: true, output: true)
+        let outputOnly = CalendarMeetingJoinSignal(
+            occurrenceDigest: occurrence.id, meetingIdentity: signal.meetingIdentity,
+            quality: .nativeProvider, isRunningInput: false, isRunningOutput: true
+        )
+        let handle = CalendarMeetingRecordingHandle(id: UUID(), outputURL: URL(fileURLWithPath: "/tmp/ad-hoc-hang-up.wav"))
+        var policy = CalendarMeetingAutomationPolicy()
+        _ = policy.reduce(.configure(adHocConfiguration(), occurrences: [occurrence], now: now))
+        _ = policy.reduce(.activity([signal], now: now))
+        _ = policy.reduce(.recordingStarted(handle: handle, occurrenceDigest: occurrence.id,
+            identity: signal.meetingIdentity, autoStopArmed: true, now: now))
+        _ = policy.reduce(.activity([signal], now: now.addingTimeInterval(60)))
+        // Hanging up stops the microphone and, a moment later, the speaker output.
+        _ = policy.reduce(.activity([outputOnly], now: now.addingTimeInterval(61)))
+        XCTAssertTrue(policy.reduce(.activity([], now: now.addingTimeInterval(62))).isEmpty)
+        XCTAssertTrue(policy.reduce(.timeAdvanced(now.addingTimeInterval(81))).isEmpty)
+        XCTAssertEqual(policy.reduce(.timeAdvanced(now.addingTimeInterval(82))), [
+            .showStopCountdown(handle, deadline: now.addingTimeInterval(97))
+        ])
+        XCTAssertTrue(policy.reduce(.timeAdvanced(now.addingTimeInterval(96.9))).isEmpty)
+        XCTAssertEqual(policy.reduce(.timeAdvanced(now.addingTimeInterval(97))), [.stopRecording(handle)])
+    }
+
+    func testAdHocAutoStopSurvivesAReconnectThatStopsMicrophoneAndSpeakerTogether() {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let (occurrence, signal) = detectedSession(at: now, provider: .teams, input: true, output: true)
+        let handle = CalendarMeetingRecordingHandle(id: UUID(), outputURL: URL(fileURLWithPath: "/tmp/ad-hoc-reconnect.wav"))
+        var policy = CalendarMeetingAutomationPolicy()
+        _ = policy.reduce(.configure(adHocConfiguration(), occurrences: [occurrence], now: now))
+        _ = policy.reduce(.activity([signal], now: now))
+        _ = policy.reduce(.recordingStarted(handle: handle, occurrenceDigest: occurrence.id,
+            identity: signal.meetingIdentity, autoStopArmed: true, now: now))
+        _ = policy.reduce(.activity([signal], now: now.addingTimeInterval(9)))
+        // A network reconnect or an audio-device switch silences the call app for 15 seconds.
+        XCTAssertTrue(policy.reduce(.activity([], now: now.addingTimeInterval(10))).isEmpty)
+        XCTAssertTrue(policy.reduce(.timeAdvanced(now.addingTimeInterval(24))).isEmpty)
+        _ = policy.reduce(.activity([signal], now: now.addingTimeInterval(25)))
+        XCTAssertFalse(policy.reduce(.timeAdvanced(now.addingTimeInterval(120))).contains {
+            if case .showStopCountdown = $0 { return true }
+            if case .stopRecording = $0 { return true }
+            return false
+        })
+    }
+
+    func testAdHocAutoStopKeepsGraceWhenTheMicrophoneWasReleasedBeforeTheAudioGap() {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let (occurrence, signal) = detectedSession(at: now, provider: .teams, input: true, output: true)
+        let muted = CalendarMeetingJoinSignal(
+            occurrenceDigest: occurrence.id, meetingIdentity: signal.meetingIdentity,
+            quality: .nativeProvider, isRunningInput: false, isRunningOutput: true
+        )
+        let handle = CalendarMeetingRecordingHandle(id: UUID(), outputURL: URL(fileURLWithPath: "/tmp/ad-hoc-muted.wav"))
+        var policy = CalendarMeetingAutomationPolicy()
+        _ = policy.reduce(.configure(adHocConfiguration(), occurrences: [occurrence], now: now))
+        _ = policy.reduce(.activity([signal], now: now))
+        _ = policy.reduce(.recordingStarted(handle: handle, occurrenceDigest: occurrence.id,
+            identity: signal.meetingIdentity, autoStopArmed: true, now: now))
+        _ = policy.reduce(.activity([muted], now: now.addingTimeInterval(1)))
+        XCTAssertTrue(policy.reduce(.activity([], now: now.addingTimeInterval(30))).isEmpty)
+        XCTAssertTrue(policy.reduce(.timeAdvanced(now.addingTimeInterval(119))).isEmpty)
+        XCTAssertEqual(policy.reduce(.timeAdvanced(now.addingTimeInterval(120))), [
+            .showStopCountdown(handle, deadline: now.addingTimeInterval(135))
+        ])
+    }
+
+    func testAdHocAutoStopIgnoresSpeakerOnlySoundAfterAHangUp() {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let (occurrence, signal) = detectedSession(at: now, provider: .teams, input: true, output: true)
+        let outputOnly = CalendarMeetingJoinSignal(
+            occurrenceDigest: occurrence.id, meetingIdentity: signal.meetingIdentity,
+            quality: .nativeProvider, isRunningInput: false, isRunningOutput: true
+        )
+        let handle = CalendarMeetingRecordingHandle(id: UUID(), outputURL: URL(fileURLWithPath: "/tmp/ad-hoc-ping.wav"))
+        var policy = CalendarMeetingAutomationPolicy()
+        _ = policy.reduce(.configure(adHocConfiguration(), occurrences: [occurrence], now: now))
+        _ = policy.reduce(.activity([signal], now: now))
+        _ = policy.reduce(.recordingStarted(handle: handle, occurrenceDigest: occurrence.id,
+            identity: signal.meetingIdentity, autoStopArmed: true, now: now))
+        _ = policy.reduce(.activity([signal], now: now.addingTimeInterval(60)))
+        // Hang-up at 61, then a chat ping from the call app plays through the speaker.
+        XCTAssertTrue(policy.reduce(.activity([], now: now.addingTimeInterval(61))).isEmpty)
+        _ = policy.reduce(.activity([outputOnly], now: now.addingTimeInterval(71)))
+        _ = policy.reduce(.activity([], now: now.addingTimeInterval(72)))
+        XCTAssertTrue(policy.reduce(.timeAdvanced(now.addingTimeInterval(80.9))).isEmpty)
+        XCTAssertEqual(policy.reduce(.timeAdvanced(now.addingTimeInterval(81))), [
+            .showStopCountdown(handle, deadline: now.addingTimeInterval(96))
+        ])
+        // A call-ended tone longer than the return dwell does not cancel the warning.
+        XCTAssertFalse(policy.reduce(.activity([outputOnly], now: now.addingTimeInterval(85)))
+            .contains(.dismissStopCountdown))
+        XCTAssertTrue(policy.reduce(.timeAdvanced(now.addingTimeInterval(89))).isEmpty)
+        XCTAssertEqual(policy.reduce(.timeAdvanced(now.addingTimeInterval(96))), [.stopRecording(handle)])
+    }
+
+    func testAdHocAutoStopCountsAudioEndingWithinFiveSecondsOfTheMicrophoneAsAHangUp() {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let session = adHocPolicyWithSpeakerLinger(4.9, at: now)
+        var policy = session.policy
+        // The gap starts at 64.9, so the 20-second hang-up grace ends at 84.9.
+        XCTAssertTrue(policy.reduce(.timeAdvanced(now.addingTimeInterval(84.8))).isEmpty)
+        XCTAssertEqual(policy.reduce(.timeAdvanced(now.addingTimeInterval(85))), [
+            .showStopCountdown(session.handle, deadline: now.addingTimeInterval(100))
+        ])
+    }
+
+    func testAdHocAutoStopKeepsGraceWhenAudioOutlastsTheMicrophoneByMoreThanFiveSeconds() {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let session = adHocPolicyWithSpeakerLinger(5.1, at: now)
+        var policy = session.policy
+        // The gap starts at 65.1 and waits the full 90 seconds.
+        XCTAssertTrue(policy.reduce(.timeAdvanced(now.addingTimeInterval(85))).isEmpty)
+        XCTAssertTrue(policy.reduce(.timeAdvanced(now.addingTimeInterval(155))).isEmpty)
+        XCTAssertEqual(policy.reduce(.timeAdvanced(now.addingTimeInterval(156))), [
+            .showStopCountdown(session.handle, deadline: now.addingTimeInterval(171))
+        ])
+    }
+
+    func testAdHocAutoStopReturnsToTheFullGraceWhenTheMicrophoneComesBackAfterAHangUp() {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let (occurrence, signal) = detectedSession(at: now, provider: .teams, input: true, output: true)
+        let outputOnly = CalendarMeetingJoinSignal(
+            occurrenceDigest: occurrence.id, meetingIdentity: signal.meetingIdentity,
+            quality: .nativeProvider, isRunningInput: false, isRunningOutput: true
+        )
+        let handle = CalendarMeetingRecordingHandle(id: UUID(), outputURL: URL(fileURLWithPath: "/tmp/ad-hoc-rejoin.wav"))
+        var policy = CalendarMeetingAutomationPolicy()
+        _ = policy.reduce(.configure(adHocConfiguration(), occurrences: [occurrence], now: now))
+        _ = policy.reduce(.activity([signal], now: now))
+        _ = policy.reduce(.recordingStarted(handle: handle, occurrenceDigest: occurrence.id,
+            identity: signal.meetingIdentity, autoStopArmed: true, now: now))
+        _ = policy.reduce(.activity([signal], now: now.addingTimeInterval(60)))
+        XCTAssertTrue(policy.reduce(.activity([], now: now.addingTimeInterval(61))).isEmpty)
+        // The microphone is back 15 seconds after the hang-up: the call is live again.
+        _ = policy.reduce(.activity([signal], now: now.addingTimeInterval(76)))
+        XCTAssertFalse(policy.reduce(.timeAdvanced(now.addingTimeInterval(200))).contains {
+            if case .showStopCountdown = $0 { return true }
+            if case .stopRecording = $0 { return true }
+            return false
+        })
+        // A later mute followed by an audio gap waits the full grace again.
+        _ = policy.reduce(.activity([outputOnly], now: now.addingTimeInterval(201)))
+        XCTAssertTrue(policy.reduce(.activity([], now: now.addingTimeInterval(230))).isEmpty)
+        XCTAssertTrue(policy.reduce(.timeAdvanced(now.addingTimeInterval(319))).isEmpty)
+        XCTAssertEqual(policy.reduce(.timeAdvanced(now.addingTimeInterval(320))), [
+            .showStopCountdown(handle, deadline: now.addingTimeInterval(335))
+        ])
+    }
+
+    /// Microphone and speaker run until 60 s; the speaker alone stops `linger` seconds later.
+    private func adHocPolicyWithSpeakerLinger(
+        _ linger: TimeInterval,
+        at now: Date
+    ) -> (policy: CalendarMeetingAutomationPolicy, handle: CalendarMeetingRecordingHandle) {
+        let (occurrence, signal) = detectedSession(at: now, provider: .teams, input: true, output: true)
+        let outputOnly = CalendarMeetingJoinSignal(
+            occurrenceDigest: occurrence.id, meetingIdentity: signal.meetingIdentity,
+            quality: .nativeProvider, isRunningInput: false, isRunningOutput: true
+        )
+        let handle = CalendarMeetingRecordingHandle(id: UUID(), outputURL: URL(fileURLWithPath: "/tmp/ad-hoc-linger.wav"))
+        var policy = CalendarMeetingAutomationPolicy()
+        _ = policy.reduce(.configure(adHocConfiguration(), occurrences: [occurrence], now: now))
+        _ = policy.reduce(.activity([signal], now: now))
+        _ = policy.reduce(.recordingStarted(handle: handle, occurrenceDigest: occurrence.id,
+            identity: signal.meetingIdentity, autoStopArmed: true, now: now))
+        _ = policy.reduce(.activity([signal], now: now.addingTimeInterval(60)))
+        _ = policy.reduce(.activity([outputOnly], now: now.addingTimeInterval(60.5)))
+        _ = policy.reduce(.activity([], now: now.addingTimeInterval(60 + linger)))
+        return (policy, handle)
     }
 
     func testAdHocSessionsRequireInputAndRetainIdentityAcrossBriefMute() throws {
