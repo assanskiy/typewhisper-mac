@@ -170,6 +170,14 @@ enum CalendarMeetingAutomationEffect: Equatable, Sendable {
 
 struct CalendarMeetingAutomationPolicy: Sendable {
     private static let autoStopSignalReturnDwell: TimeInterval = 3
+    /// Ad-hoc calls have no calendar event, so an audio gap after a mute waits this long.
+    private static let adHocAutoStopIdleGrace: TimeInterval = 90
+    /// Meeting audio that ends this soon after the call app last used the microphone
+    /// is likely a hang-up, not a mute, and waits only the shorter hang-up grace.
+    private static let autoStopHangUpInputWindow: TimeInterval = 5
+    /// Short enough to drop most of the post-call tail, long enough for a reconnect or
+    /// an audio-device switch to bring the meeting audio back.
+    private static let adHocAutoStopHangUpGrace: TimeInterval = 20
 
     private struct DwellState: Equatable, Sendable {
         let identity: CalendarMeetingCanonicalLink
@@ -197,6 +205,10 @@ struct CalendarMeetingAutomationPolicy: Sendable {
         var missingSince: Date?
         var stopDeadline: Date?
         var signalReturnSince: Date?
+        var lastInputAt: Date?
+        /// Set when an audio gap starts right after the call app's last microphone use.
+        /// Only the microphone coming back clears it.
+        var hungUp = false
         var stickyVeto = false
         var stopRequested = false
         var hasObservedSignal = false
@@ -373,7 +385,7 @@ struct CalendarMeetingAutomationPolicy: Sendable {
                 occurrenceDigest: occurrenceDigest,
                 identity: identity,
                 autoStopArmed: autoStopArmed && configuration.autoStopEnabled,
-                idleGrace: occurrence(for: occurrenceDigest)?.isAdHoc == true ? 90 : 0,
+                idleGrace: occurrence(for: occurrenceDigest)?.isAdHoc == true ? Self.adHocAutoStopIdleGrace : 0,
                 missingSince: nil,
                 stopDeadline: nil,
                 signalReturnSince: nil,
@@ -895,11 +907,19 @@ struct CalendarMeetingAutomationPolicy: Sendable {
             return
         }
 
-        let signalPresent = signals.contains {
+        let matchingSignals = signals.filter {
             $0.occurrenceDigest == recording.occurrenceDigest
                 && $0.meetingIdentity == recording.identity
                 && $0.countsForAutoStop
         }
+        let inputRunning = matchingSignals.contains(where: \.isRunningInput)
+        if inputRunning {
+            recording.lastInputAt = now
+            recording.hungUp = false
+        }
+        // After a hang-up, speaker-only sound from the call app (a chat ping, the
+        // call-ended tone) does not mean the call is back; only the microphone does.
+        let signalPresent = recording.hungUp ? inputRunning : !matchingSignals.isEmpty
         if signalPresent {
             recording.hasObservedSignal = true
             guard recording.stopDeadline != nil else {
@@ -936,10 +956,21 @@ struct CalendarMeetingAutomationPolicy: Sendable {
         }
 
         if recording.stopDeadline == nil {
-            if recording.missingSince == nil { recording.missingSince = now }
+            if recording.missingSince == nil {
+                recording.missingSince = now
+                // A call app releases the microphone together with the meeting audio when
+                // the call ends; only a gap that follows an earlier mute waits through the
+                // full grace. Calendar recordings have no grace to shorten.
+                if recording.idleGrace > Self.adHocAutoStopHangUpGrace,
+                   let lastInputAt = recording.lastInputAt,
+                   now.timeIntervalSince(lastInputAt) <= Self.autoStopHangUpInputWindow {
+                    recording.hungUp = true
+                }
+            }
             activeRecording = recording
-            guard let missingSince = recording.missingSince,
-                  now.timeIntervalSince(missingSince) >= recording.idleGrace else { return }
+            guard let missingSince = recording.missingSince else { return }
+            let idleGrace = recording.hungUp ? Self.adHocAutoStopHangUpGrace : recording.idleGrace
+            guard now.timeIntervalSince(missingSince) >= idleGrace else { return }
             let deadline = now.addingTimeInterval(15)
             recording.stopDeadline = deadline
             activeRecording = recording
