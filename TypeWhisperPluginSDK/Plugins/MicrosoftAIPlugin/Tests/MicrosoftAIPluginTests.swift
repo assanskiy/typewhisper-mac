@@ -345,6 +345,37 @@ final class MicrosoftAIPluginTests: XCTestCase {
         XCTAssertFalse(body.contains("diarization"))
     }
 
+    /// Speaker detection needs the words to split MAI's long segments
+    /// between the speakers in them (#1772).
+    func testWordTimestampsAreRequestedAndReportedWhenTheHostCollectsThem() async throws {
+        let plugin = MicrosoftAIPlugin()
+        plugin.activate(host: try configuredHost())
+
+        let store = PluginHTTPClientSessionStore()
+        PluginHTTPClientTestHarness.configure { _ in
+            store.makeSession(outcomes: [
+                .success(Self.successResponseData, Self.httpResponse(statusCode: 200)),
+            ])
+        }
+
+        let collector = PluginWordTimingCollector()
+        _ = try await PluginWordTimings.$collector.withValue(collector) {
+            try await plugin.transcribeStructured(
+                audio: Self.audio,
+                language: nil,
+                translate: false,
+                prompt: nil
+            )
+        }
+
+        let body = String(
+            decoding: try XCTUnwrap(store.sessions.first?.requestedRequests.first?.httpBody),
+            as: UTF8.self
+        )
+        XCTAssertTrue(body.contains("\"timestamps\":\"word\""))
+        XCTAssertEqual(collector.words, [PluginWordTiming(text: "Hallo", start: 0.25, end: 0.75)])
+    }
+
     func testResponseParsingPreservesLocaleTimingsAndSpeakers() throws {
         let result = try MicrosoftAITranscriptionClient.parseResponse(Self.successResponseData)
 

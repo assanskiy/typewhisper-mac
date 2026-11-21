@@ -1212,6 +1212,45 @@ final class SpeakerChannelAttributionTests: XCTestCase {
             PluginSpeakerTurn(speakerLabel: own, start: 18, end: 20),
         ])
     }
+
+    /// A voice in the room that the microphone picks up at three times its
+    /// noise floor is not the user, and doesn't become "Me" (#1772).
+    func testAVoiceInTheRoomNearTheNoiseFloorIsNotOwnSpeech() {
+        // Noise at 0.01 gives a floor of about 0.007. The user talks at 1–3 s;
+        // a voice in the room at 5–7 s passes the frame threshold of three
+        // times the floor, at about 3.3 times.
+        let microphone = track(duration: 10, words: [(1...3, 1), (5...7, 0.165)], level: 0.2, noise: 0.01)
+        let system = track(duration: 10, speech: [], level: 0)
+
+        let ranges = SpeakerChannelAttribution.ownSpeechRanges(microphone: microphone, system: system)
+
+        XCTAssertEqual(ranges.count, 1)
+        XCTAssertEqual(ranges.first?.lowerBound ?? -1, 0.9, accuracy: 0.06)
+        XCTAssertEqual(ranges.first?.upperBound ?? -1, 3.1, accuracy: 0.06)
+    }
+
+    /// The diarizer hears the mixed recording and can merge a remote voice
+    /// into the user's. Only short stretches of that speaker go to "Me"
+    /// without the microphone; the remote voice's turns keep their label (#1772).
+    func testARemoteVoiceMergedIntoTheUsersSpeakerStaysOutOfMe() {
+        let own = SpeakerChannelAttribution.ownSpeakerLabel
+        let turns = [
+            PluginSpeakerTurn(speakerLabel: "merged", start: 0, end: 20),
+            PluginSpeakerTurn(speakerLabel: "remote", start: 20, end: 25),
+            PluginSpeakerTurn(speakerLabel: "merged", start: 25, end: 29),
+        ]
+
+        // 13.5 of the merged speaker's 24 s are on the microphone.
+        let combined = SpeakerChannelAttribution.combining(turns, ownSpeech: [0.5...14])
+
+        XCTAssertEqual(combined, [
+            PluginSpeakerTurn(speakerLabel: own, start: 0, end: 0.5),
+            PluginSpeakerTurn(speakerLabel: own, start: 0.5, end: 14),
+            PluginSpeakerTurn(speakerLabel: "merged", start: 14, end: 20),
+            PluginSpeakerTurn(speakerLabel: "remote", start: 20, end: 25),
+            PluginSpeakerTurn(speakerLabel: "merged", start: 25, end: 29),
+        ])
+    }
 }
 
 /// The Speakers row, and the VoiceOver value read from it, show the step a record runs next.
