@@ -324,6 +324,106 @@ final class SpeakerWordAlignmentTests: XCTestCase {
         XCTAssertEqual(segments.map(\.text), [sentence.text])
         XCTAssertEqual(segments.map(\.speakerID), ["S1"])
     }
+
+    /// MAI-Transcribe-2 returns minute-long phrases in a conversation. With
+    /// per-word times, only the words inside the microphone's own speech go
+    /// to "Me", even when the phrase text writes a number as digits and the
+    /// next phrase starts just before this one ends (#1772).
+    func testALongPhraseIsSplitSoMeHoldsOnlyTheMicrophonesOwnWords() throws {
+        let lines: [(speaker: String, text: String)] = [
+            ("anna", "Good morning everyone, thanks for joining so early. Let me share the numbers from last week first, and then we can talk about the launch plan."),
+            ("me", "Sounds good. Before you start, I spoke with the design team yesterday and they still need the final copy for the onboarding screens."),
+            ("anna", "Right, that is on my list. So the trial went well overall, about twenty five people signed up in the first two days, which is more than we expected."),
+            ("boris", "That matches what support saw as well. Most questions were about pricing and the export feature, not about bugs."),
+            ("me", "Good to hear. I can write the pricing page this week if someone sends me the current tiers and the discount rules."),
+            ("boris", "I will send them today after lunch. We also need to decide whether the export stays in the free plan or moves to the paid one."),
+            ("me", "My vote is to keep it free for now, because people use it to try the product with real data."),
+            ("anna", "Fair point, let us keep it free until the next review and look at the numbers again at the end of the month."),
+        ]
+        // MAI words carry no punctuation; the phrase text does, and number
+        // normalization writes "twenty five" as "25".
+        func spokenWords(_ text: String, from start: TimeInterval) -> [TranscriptionWord] {
+            text.split(separator: " ").enumerated().map { index, token in
+                let begin = start + Double(index) * 0.5
+                return TranscriptionWord(text: token.filter { $0.isLetter || $0.isNumber }, start: begin, end: begin + 0.45)
+            }
+        }
+        var lineWords: [[TranscriptionWord]] = []
+        var time: TimeInterval = 0
+        for line in lines {
+            let words = spokenWords(line.text, from: time)
+            lineWords.append(words)
+            time = words.last!.end + 0.45
+        }
+        let phraseEnd = lineWords.last!.last!.end
+        let phrase = lines.map(\.text).joined(separator: " ").replacingOccurrences(of: "twenty five", with: "25")
+        // The next phrase's first word starts 30 ms before this phrase ends.
+        let nextText = "Okay, let us move on to the budget."
+        let nextWords = spokenWords(nextText, from: phraseEnd - 0.03)
+        let nextEnd = nextWords.last!.end
+        XCTAssertGreaterThanOrEqual(phraseEnd, 60)
+        XCTAssertGreaterThanOrEqual(lineWords.joined().count, 150)
+
+        let text = phrase + " " + nextText
+        let timedText = [
+            TimedTextEntry(text: phrase, start: 0, end: phraseEnd, utf16Location: 0, utf16Length: (phrase as NSString).length),
+            TimedTextEntry(
+                text: nextText,
+                start: phraseEnd - 0.03,
+                end: nextEnd,
+                utf16Location: (phrase as NSString).length + 1,
+                utf16Length: (nextText as NSString).length
+            ),
+        ]
+        // The microphone's own speech, padded as SpeakerChannelAttribution pads it.
+        let ownSpeech = zip(lines, lineWords)
+            .filter { $0.0.speaker == "me" }
+            .map { ($0.1.first!.start - 0.1)...($0.1.last!.end + 0.1) }
+        // The diarizer hears the mixed recording and merges the user into
+        // whoever talks around them.
+        let diarized = [
+            PluginSpeakerTurn(speakerLabel: "anna", start: 0, end: lineWords[2].last!.end),
+            PluginSpeakerTurn(speakerLabel: "boris", start: lineWords[3].first!.start, end: lineWords[5].last!.end),
+            PluginSpeakerTurn(speakerLabel: "anna", start: lineWords[6].first!.start, end: phraseEnd),
+            PluginSpeakerTurn(speakerLabel: "boris", start: phraseEnd - 0.03, end: nextEnd),
+        ]
+        let rawTurns = SpeakerChannelAttribution.combining(diarized, ownSpeech: ownSpeech)
+            .map { SpeakerTurn(speakerID: $0.speakerLabel, start: $0.start, end: $0.end) }
+        let me = try XCTUnwrap(SpeakerAlignment.speakerNumbering(rawTurns)[SpeakerChannelAttribution.ownSpeakerLabel])
+
+        let transcript = try XCTUnwrap(SpeakerAlignment.transcript(
+            text: text,
+            timedText: timedText,
+            granularity: .segment,
+            turns: SpeakerAlignment.normalizedTurns(rawTurns),
+            words: lineWords.flatMap { $0 } + nextWords
+        ))
+
+        func tokens(_ text: String) -> [String] {
+            text.split(separator: " ").map { $0.filter { $0.isLetter || $0.isNumber }.lowercased() }
+        }
+        let meParts = transcript.segments.filter { $0.speakerID == me }.map { tokens($0.text) }
+        let ownParts = zip(lines, lineWords).filter { $0.0.speaker == "me" }.map { $0.1.map { $0.text.lowercased() } }
+        XCTAssertEqual(meParts.count, ownParts.count, transcript.segments.map(\.text).description)
+        for (actual, expected) in zip(meParts, ownParts) {
+            // At most one word more or less at either end.
+            let matches = [0, 1].contains { dropActualStart in
+                [0, 1].contains { dropActualEnd in
+                    [0, 1].contains { dropExpectedStart in
+                        [0, 1].contains { dropExpectedEnd in
+                            Array(actual.dropFirst(dropActualStart).dropLast(dropActualEnd))
+                                == Array(expected.dropFirst(dropExpectedStart).dropLast(dropExpectedEnd))
+                        }
+                    }
+                }
+            }
+            XCTAssertTrue(matches, "\(actual) vs \(expected)")
+        }
+        // The rest goes to the other speakers, and no text is lost.
+        let others = transcript.segments.filter { $0.speakerID != me }
+        XCTAssertEqual(Set(others.compactMap(\.speakerID)).count, 2)
+        XCTAssertEqual(transcript.segments.flatMap { tokens($0.text) }, tokens(text))
+    }
 }
 
 @MainActor

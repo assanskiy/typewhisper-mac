@@ -143,6 +143,10 @@ enum SpeakerAlignment {
     /// this many in a row; a single word is overlap noise at a turn boundary.
     static let minimumWordRun = 2
 
+    /// Share of a segment's words that must be found in its text before the
+    /// segment is split between speakers.
+    static let minimumMappedShare = 0.9
+
     /// Assigns sentence segments and splits a segment where the speaker
     /// changes between two of its words. Segments stay sentences, so a turn
     /// can still be broken into paragraphs; without words for a segment the
@@ -167,10 +171,13 @@ enum SpeakerAlignment {
 
         for sentence in sentences {
             while wordIndex < words.count, words[wordIndex].end <= sentence.start - 0.05 { wordIndex += 1 }
+            // A word belongs to the segment its middle falls in, so a word of
+            // the next phrase that starts just before this one ends stays out.
             var spoken: [TranscriptionWord] = []
             var index = wordIndex
             while index < words.count, words[index].start < sentence.end + 0.05 {
-                spoken.append(words[index])
+                let middle = (words[index].start + max(words[index].start, words[index].end)) / 2
+                if middle >= sentence.start, middle < sentence.end { spoken.append(words[index]) }
                 index += 1
             }
             let mapped = TimedTextEntry.map(
@@ -183,8 +190,13 @@ enum SpeakerAlignment {
                 end: sentence.end,
                 assignment: assignment(for: sentence.start...max(sentence.start, sentence.end), in: turns)
             )
-            // Only split when every word was found; otherwise text positions are unreliable.
-            guard mapped.count == spoken.count, mapped.count >= 2 * minimumWordRun else {
+            // Split when nearly every word was found. Words the segment text
+            // spells differently (numbers written as digits, for example) are
+            // skipped: their text stays between the found words around them
+            // and goes with those. With more words missing, text positions
+            // are unreliable.
+            guard Double(mapped.count) >= minimumMappedShare * Double(spoken.count),
+                  mapped.count >= 2 * minimumWordRun else {
                 pieces.append(whole)
                 continue
             }

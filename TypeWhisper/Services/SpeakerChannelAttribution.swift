@@ -20,6 +20,12 @@ enum SpeakerChannelAttribution {
     static let maximumPause: TimeInterval = 0.4
     static let minimumDuration: TimeInterval = 0.3
     static let padding: TimeInterval = 0.1
+    /// A stretch of own speech is louder than this many times the
+    /// microphone's noise floor in its loudest tenth. Calibrated on recordings
+    /// from a USB webcam microphone (Logitech C920) with closed headphones: voices
+    /// from the room (a video, a podcast, someone nearby) reached 1.6 to 3 times
+    /// the floor, the user's speech 6 times and more, and a soft one-word answer 3.7.
+    static let minimumSpeechToFloor: Float = 3.5
 
     /// Longest delay searched between a sound on the system audio and its
     /// echo on the microphone. The system capture starts after the
@@ -48,6 +54,9 @@ enum SpeakerChannelAttribution {
     /// audio, relative to each track's own loudness. That rule alone applies
     /// without a measurable echo, and it keeps an echo measured at the wrong
     /// delay from adding own speech.
+    ///
+    /// A stretch whose loudest tenth stays below `minimumSpeechToFloor`
+    /// times the noise floor is another voice in the room, not the user.
     static func ownSpeechRanges(
         microphone: [Float],
         system: [Float],
@@ -70,21 +79,24 @@ enum SpeakerChannelAttribution {
             return echo.map { level >= echoMargin * $0[index] } ?? true
         }
 
-        var ranges: [(start: TimeInterval, end: TimeInterval)] = []
+        var ranges: [(start: TimeInterval, end: TimeInterval, frames: ClosedRange<Int>)] = []
         for (index, level) in microphoneLevels.enumerated() {
             guard level > threshold, standsOutFromSystemAudio(index, level) else { continue }
             let start = Double(index) * frameDuration
             let end = start + frameDuration
             if let last = ranges.last, start - last.end <= maximumPause {
                 ranges[ranges.count - 1].end = end
+                ranges[ranges.count - 1].frames = last.frames.lowerBound...index
             } else {
-                ranges.append((start, end))
+                ranges.append((start, end, index...index))
             }
         }
 
         let duration = Double(microphone.count) / sampleRate
+        let speechLevel = microphoneFloor * minimumSpeechToFloor
         return ranges
             .filter { $0.end - $0.start >= minimumDuration }
+            .filter { percentile(Array(microphoneLevels[$0.frames]), 0.90) >= speechLevel }
             .map { max(0, $0.start - padding)...min(duration, $0.end + padding) }
     }
 
@@ -95,6 +107,9 @@ enum SpeakerChannelAttribution {
     /// user is the user too. What the microphone missed of them (soft words,
     /// overlap) goes to `ownSpeakerLabel` as well, so the user doesn't show
     /// up a second time, or under the name of their own voice profile.
+    /// Only up to `maximumMissedOwnSpeech` at a time: the diarizer hears the
+    /// mixed recording and can merge a remote voice into the user's, and a
+    /// longer stretch without the microphone is that remote voice.
     static func combining(
         _ turns: [PluginSpeakerTurn],
         ownSpeech: [ClosedRange<TimeInterval>]
@@ -104,16 +119,23 @@ enum SpeakerChannelAttribution {
         let ownLabels = labelsMostlyOnMicrophone(turns, ownSpeech: own)
         var combined: [PluginSpeakerTurn] = []
         for turn in turns {
-            let label = ownLabels.contains(turn.speakerLabel) ? ownSpeakerLabel : turn.speakerLabel
+            let isOwnVoice = ownLabels.contains(turn.speakerLabel)
+            func label(from start: TimeInterval, to end: TimeInterval) -> String {
+                isOwnVoice && end - start <= maximumMissedOwnSpeech ? ownSpeakerLabel : turn.speakerLabel
+            }
             var start = turn.start
             for range in own where range.upperBound > start && range.lowerBound < turn.end {
                 if range.lowerBound - start >= minimumRemainder {
-                    combined.append(PluginSpeakerTurn(speakerLabel: label, start: start, end: range.lowerBound))
+                    combined.append(PluginSpeakerTurn(
+                        speakerLabel: label(from: start, to: range.lowerBound),
+                        start: start,
+                        end: range.lowerBound
+                    ))
                 }
                 start = max(start, range.upperBound)
             }
             if turn.end - start >= minimumRemainder {
-                combined.append(PluginSpeakerTurn(speakerLabel: label, start: start, end: turn.end))
+                combined.append(PluginSpeakerTurn(speakerLabel: label(from: start, to: turn.end), start: start, end: turn.end))
             }
         }
         combined.append(contentsOf: own.map {
@@ -141,6 +163,10 @@ enum SpeakerChannelAttribution {
 
     /// What is left of a diarizer turn around own speech only counts from this length.
     static let minimumRemainder: TimeInterval = 0.2
+    /// Longest stretch of the user's diarizer speaker that goes to
+    /// `ownSpeakerLabel` without the microphone: a few soft words or a short
+    /// overlap.
+    static let maximumMissedOwnSpeech: TimeInterval = 3
 
     /// The level the system audio's echo is expected to reach in each
     /// microphone frame, or nil when the recording shows no echo.

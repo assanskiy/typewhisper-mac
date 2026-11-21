@@ -174,12 +174,19 @@ struct MicrosoftAITranscriptionClient: Sendable {
             let text: String
         }
 
+        struct Word: Decodable {
+            let text: String
+            let offsetMilliseconds: Double?
+            let durationMilliseconds: Double?
+        }
+
         struct Phrase: Decodable {
             let offsetMilliseconds: Double?
             let durationMilliseconds: Double?
             let text: String
             let locale: String?
             let speaker: FlexibleSpeaker?
+            let words: [Word]?
         }
 
         let combinedPhrases: [CombinedPhrase]?
@@ -263,6 +270,9 @@ struct MicrosoftAITranscriptionClient: Sendable {
         }
 
         let isLegacyModel = MicrosoftAIPlugin.isLegacyModel(model)
+        // Word timing lets speaker detection split MAI's long segments,
+        // which run for minutes in conversations, between speakers.
+        let requestsWordTimings = PluginWordTimings.collector != nil
         let definition = Definition(
             locales: Self.locales(from: languageSelection),
             enhancedMode: Definition.EnhancedMode(
@@ -271,7 +281,7 @@ struct MicrosoftAITranscriptionClient: Sendable {
                 modelOptions: isLegacyModel
                     ? nil
                     : Definition.EnhancedMode.ModelOptions(
-                        timestamps: "segment",
+                        timestamps: requestsWordTimings ? "word" : "segment",
                         transcribeStyle: transcriptStyle.rawValue
                     )
             ),
@@ -311,7 +321,11 @@ struct MicrosoftAITranscriptionClient: Sendable {
 
         switch httpResponse.statusCode {
         case 200:
-            return try Self.parseResponse(data)
+            let parsed = try Self.parseResponseWithWords(data)
+            if requestsWordTimings {
+                PluginWordTimings.report(parsed.words)
+            }
+            return parsed.result
         case 401, 403:
             throw PluginTranscriptionError.invalidApiKey
         case 413:
@@ -385,6 +399,14 @@ struct MicrosoftAITranscriptionClient: Sendable {
     }
 
     static func parseResponse(_ data: Data) throws -> PluginStructuredTranscriptionResult {
+        try parseResponseWithWords(data).result
+    }
+
+    /// The transcript and the words with their times, which Azure returns
+    /// for `timestamps: "word"`.
+    static func parseResponseWithWords(
+        _ data: Data
+    ) throws -> (result: PluginStructuredTranscriptionResult, words: [PluginWordTiming]) {
         let response: ResponseBody
         do {
             response = try JSONDecoder().decode(ResponseBody.self, from: data)
@@ -430,11 +452,20 @@ struct MicrosoftAITranscriptionClient: Sendable {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first { !$0.isEmpty }
 
-        return PluginStructuredTranscriptionResult(
+        let words = (response.phrases ?? []).flatMap { $0.words ?? [] }.compactMap { word -> PluginWordTiming? in
+            let spoken = word.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !spoken.isEmpty else { return nil }
+            let start = max(word.offsetMilliseconds ?? 0, 0) / 1_000
+            let duration = max(word.durationMilliseconds ?? 0, 0) / 1_000
+            return PluginWordTiming(text: spoken, start: start, end: start + duration)
+        }
+
+        let result = PluginStructuredTranscriptionResult(
             text: text,
             detectedLanguage: detectedLanguage,
             segments: segments
         )
+        return (result, words)
     }
 
     static func locales(from selection: PluginLanguageSelection) -> [String]? {
