@@ -442,6 +442,64 @@ final class PluginHTTPClientTests: XCTestCase {
         XCTAssertEqual(store.sessions.flatMap(\.requestedPaths), ["/transcribe", "/transcribe"])
     }
 
+    func testFailingOverAfterTimeoutDoesNotSendAgainAndDropsTheStalledSession() async throws {
+        // #1769: a cleanup request on a stalled connection timed out after 30 s and was
+        // sent again at once, so the dictation waited 54 s and the next provider never ran.
+        let store = MockHTTPSessionStore()
+        PluginHTTPClient.configureForTesting { _ in
+            if store.sessions.isEmpty {
+                return store.makeSession(outcomes: [.failure(URLError(.timedOut))])
+            }
+            return store.makeSession(outcomes: [.success(Self.okResponse())])
+        }
+        PluginHTTPClient.configureRetryForTesting(sleeper: { _ in })
+
+        do {
+            _ = try await PluginHTTPClient.dataFailingOverAfterTimeout(for: Self.request(path: "/chat"), resourceTimeout: 30)
+            XCTFail("a request that fails over must not be sent again after a timeout")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .timedOut)
+        }
+        XCTAssertEqual(store.sessions.flatMap(\.requestedPaths), ["/chat"])
+        XCTAssertTrue(store.sessions[0].didInvalidate, "the next request must not reuse the stalled connection")
+    }
+
+    func testFailingOverAfterTimeoutStillRetriesAStaleConnection() async throws {
+        let store = MockHTTPSessionStore()
+        PluginHTTPClient.configureForTesting { _ in
+            if store.sessions.isEmpty {
+                return store.makeSession(outcomes: [.failure(URLError(.networkConnectionLost))])
+            }
+            return store.makeSession(outcomes: [.success(Self.okResponse())])
+        }
+        PluginHTTPClient.configureRetryForTesting(sleeper: { _ in })
+
+        let (_, response) = try await PluginHTTPClient.dataFailingOverAfterTimeout(for: Self.request(path: "/chat"), resourceTimeout: 30)
+
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(store.sessions.flatMap(\.requestedPaths), ["/chat", "/chat"])
+    }
+
+    func testChatHelperDoesNotSendAgainAfterATimeout() async throws {
+        let store = MockHTTPSessionStore()
+        PluginHTTPClient.configureForTesting { _ in
+            if store.sessions.isEmpty {
+                return store.makeSession(outcomes: [.failure(URLError(.timedOut))])
+            }
+            return store.makeSession(outcomes: [.success(Self.okResponse())])
+        }
+        PluginHTTPClient.configureRetryForTesting(sleeper: { _ in })
+        let helper = PluginOpenAIChatHelper(baseURL: "https://example.test")
+
+        do {
+            _ = try await helper.process(apiKey: "test-key", model: "m", systemPrompt: "s", userText: "u")
+            XCTFail("a timed-out chat request must reach the caller's fallback, not be sent again")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .timedOut)
+        }
+        XCTAssertEqual(store.sessions.flatMap(\.requestedPaths), ["/v1/chat/completions"])
+    }
+
     func testTimeoutStillGetsTheCompatibilityImmediateRetry() async throws {
         // This asserted the OPPOSITE until CodeRabbit caught it. Narrowing the
         // immediate retry to stale-pool codes ALTERED pre-existing behaviour rather

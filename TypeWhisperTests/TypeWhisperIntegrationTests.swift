@@ -339,6 +339,7 @@ final class TypeWhisperIntegrationTests: XCTestCase {
             case delayedResponse(String, milliseconds: Int)
             case rateLimit
             case networkFailure
+            case timedOut
             case apiFailure(String)
             case waitForCancellation
         }
@@ -462,6 +463,8 @@ final class TypeWhisperIntegrationTests: XCTestCase {
                 throw LLMError.providerError("HTTP 429 Too Many Requests")
             case .networkFailure:
                 throw URLError(.notConnectedToInternet)
+            case .timedOut:
+                throw URLError(.timedOut)
             case .apiFailure(let message):
                 throw LLMError.providerError(message)
             case .waitForCancellation:
@@ -17817,6 +17820,36 @@ final class TypeWhisperIntegrationTests: XCTestCase {
 
         XCTAssertEqual(explicit.processCallCount, 1)
         XCTAssertEqual(fallback.processCallCount, 0)
+    }
+
+    @MainActor
+    func testWorkflowWithoutProviderMovesToNextFallbackAfterTimeout() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+        let isolatedDefaults = Self.makeEmptyLLMFallbackDefaults()
+        defer { isolatedDefaults.defaults.removePersistentDomain(forName: isolatedDefaults.suiteName) }
+
+        let stalled = MockLLMProviderPlugin()
+        stalled.configuredProviderId = "stalled-provider"
+        stalled.queuedProcessOutcomes = [.timedOut]
+        let next = MockLLMProviderPlugin()
+        next.configuredProviderId = "next-provider"
+        next.queuedProcessOutcomes = [.response("cleaned by next provider")]
+
+        Self.installLLMFallbackTestProviders([stalled, next], appSupportDirectory: appSupportDirectory)
+        let service = PromptProcessingService(userDefaults: isolatedDefaults.defaults)
+        service.addLLMFallback(providerId: stalled.providerId)
+        service.addLLMFallback(providerId: next.providerId)
+
+        let result = try await service.processWorkflow(
+            prompt: "Fix grammar",
+            text: "hello world",
+            behavior: WorkflowBehavior()
+        )
+
+        XCTAssertEqual(result, "cleaned by next provider")
+        XCTAssertEqual(stalled.processCallCount, 1)
+        XCTAssertEqual(next.processCallCount, 1)
     }
 
     @MainActor
