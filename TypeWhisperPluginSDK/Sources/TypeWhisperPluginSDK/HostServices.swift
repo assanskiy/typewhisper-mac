@@ -266,6 +266,26 @@ public enum PluginHTTPClient {
         )
     }
 
+    /// Like `data(for:resourceTimeout:)`, for a request the user waits on while the
+    /// caller has a fallback, such as the chat completion that cleans up a dictation.
+    /// After a timeout it is not sent again: the immediate retry doubled a wait that
+    /// had already reached the request's timeout, and the caller's next provider or
+    /// the unprocessed text answers sooner (#1769). The stalled pooled connection is
+    /// still dropped, and every other transient failure, such as a stale connection
+    /// lost at once, keeps the one immediate retry.
+    static func dataFailingOverAfterTimeout(
+        for request: URLRequest,
+        resourceTimeout: TimeInterval?
+    ) async throws -> (Data, URLResponse) {
+        try ensureNetworkAccessIsAllowed()
+        return try await dataWithRetries(
+            for: request,
+            policy: .default,
+            dedicatedConfiguration: dedicatedConfiguration(forResourceTimeout: resourceTimeout),
+            retriesAfterTimeout: false
+        )
+    }
+
     /// Uploads that may take longer than the shared session's 600 s get their own session.
     private static func dedicatedConfiguration(forResourceTimeout resourceTimeout: TimeInterval?) -> URLSessionConfiguration? {
         guard let resourceTimeout, resourceTimeout > longRunningResourceTimeout else { return nil }
@@ -396,7 +416,8 @@ public enum PluginHTTPClient {
         for request: URLRequest,
         policy: PluginHTTPRetryPolicy,
         dedicatedConfiguration: URLSessionConfiguration? = nil,
-        sendsOnce: Bool = false
+        sendsOnce: Bool = false,
+        retriesAfterTimeout: Bool = true
     ) async throws -> (Data, URLResponse) {
         let deadline = ContinuousClock.now + retrySchedulingBudget
         let method = request.httpMethod ?? "GET"
@@ -521,6 +542,11 @@ public enum PluginHTTPClient {
                 if stopsOnDedicatedSession || (sendsOnce && mayHaveReachedServer) {
                     logger.error("\(method) \(url) failed after \(elapsed), may have reached the server, not retrying: \(error.localizedDescription)")
                     throw describingRejectedLargeUpload(error, request: request)
+                }
+
+                if !retriesAfterTimeout && code == .timedOut {
+                    logger.error("\(method) \(url) timed out after \(elapsed), not retrying so the caller can fall back: \(error.localizedDescription)")
+                    throw error
                 }
 
                 // Compatibility, and it applies under BOTH policies: one immediate
@@ -1920,7 +1946,12 @@ public struct PluginOpenAIChatHelper: Sendable {
         request.timeoutInterval = requestTimeout
         request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
 
-        let (data, response) = try await PluginHTTPClient.data(for: request, resourceTimeout: requestTimeout)
+        // A dictation waits on this reply and falls back to the next LLM provider or
+        // to its raw text, so a timeout ends the attempt instead of sending again.
+        let (data, response) = try await PluginHTTPClient.dataFailingOverAfterTimeout(
+            for: request,
+            resourceTimeout: requestTimeout
+        )
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw PluginChatError.networkError("Invalid response")
