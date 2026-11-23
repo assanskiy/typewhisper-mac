@@ -1,4 +1,4 @@
-# Fork-only: daily rebase of the delta onto upstream main, promoted to `fork` only after fork-check passes.
+# Fork-only: daily mirror of upstream main into `main` and rebase of the fork tooling (`tooling`), promoted only after fork-check passes.
 # FORK_SYNC_TOKEN: fine-grained PAT for this repository only (Contents, Workflows, Actions, Issues: read and write);
 # the built-in token cannot push commits that touch .github/workflows, and upstream edits them often.
 name: fork-sync
@@ -30,7 +30,7 @@ jobs:
           [ -n "$GH_TOKEN" ] || { echo "::error::secret FORK_SYNC_TOKEN is not set, see the header of this file"; exit 1; }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: fork
+          ref: tooling
           fetch-depth: 0
           token: ${{ secrets.FORK_SYNC_TOKEN }}
       - name: Keep upstream workflows off in the fork
@@ -42,19 +42,19 @@ jobs:
         run: |
           git config user.name "fork-sync"
           git config user.email "fork-sync@users.noreply.github.com"
-          echo "old=$(git rev-parse origin/fork)" >> "$GITHUB_OUTPUT"
+          echo "old=$(git rev-parse origin/tooling)" >> "$GITHUB_OUTPUT"
           rc=0; bash fork/sync.sh > sync.log 2>&1 || rc=$?
           cat sync.log
           if [ "$rc" = 2 ]; then echo "status=conflict" >> "$GITHUB_OUTPUT"; exit 0; fi
           [ "$rc" = 0 ] || exit "$rc"
           git push --force origin upstream/main:refs/heads/main
-          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/fork)" ]; then echo "status=same" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/tooling)" ]; then echo "status=same" >> "$GITHUB_OUTPUT"; exit 0; fi
           git push --force origin HEAD:refs/heads/sync/candidate
           echo "status=candidate" >> "$GITHUB_OUTPUT"
       - name: Conflict issue
         if: steps.sync.outputs.status == 'conflict'
         run: |
-          body="$(printf 'Rebasing `fork` onto upstream main stopped; `fork` is unchanged.\n\n```\n%s\n```\nResolve per fork/README.md § Sync.' "$(tail -n 40 sync.log)")"
+          body="$(printf 'Rebasing `tooling` onto upstream main stopped; `tooling` is unchanged.\n\n```\n%s\n```\nResolve per fork/README.md § Sync.' "$(tail -n 40 sync.log)")"
           open="$(gh issue list --state open --search 'sync conflict in:title' --json number --jq '.[0].number')"
           if [ -n "$open" ]; then gh issue comment "$open" --body "$body"; else gh issue create --title "sync conflict" --body "$body"; fi
           exit 1
@@ -75,5 +75,5 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.FORK_SYNC_TOKEN }}
-      - name: Move fork to the checked candidate
-        run: git push --force-with-lease=fork:${{ needs.rebase.outputs.old }} origin origin/sync/candidate:refs/heads/fork
+      - name: Move tooling to the checked candidate
+        run: git push --force-with-lease=tooling:${{ needs.rebase.outputs.old }} origin origin/sync/candidate:refs/heads/tooling

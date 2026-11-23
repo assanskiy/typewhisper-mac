@@ -1,10 +1,10 @@
-# Fork-only: unsigned macOS build of a fork branch with upstream's own toolchain and setup scripts.
+# Fork-only: unsigned macOS build of a fork branch (`tooling` or a `pr/*` branch) with upstream's own toolchain and setup scripts.
 name: fork-check
 
 on:
   push:
-    branches: [fork]
-  # A pr/* branch carries no fork tooling: dispatch on `fork` with `ref: pr/<branch>`.
+    branches: [tooling]
+  # A pr/* branch carries no fork tooling: dispatch on `tooling` with `ref: pr/<branch>`.
   workflow_dispatch:
     inputs:
       ref:
